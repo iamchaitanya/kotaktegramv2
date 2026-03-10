@@ -84,10 +84,48 @@ class PaperTrader:
                     })
         # close_position already removes from _open_positions
 
-    async def place_order(self, signal: dict, signal_id: int, lot_size: int = None) -> dict:
+    async def place_order(self, signal: dict, signal_id: int, lot_size: int = None, strategy: dict = None) -> dict:
         """Place a paper order that will fill when LTP enters entry range."""
         from .config import Config
         qty = lot_size or int(Config.DEFAULT_LOT_SIZE)
+        strategy = strategy or {}
+
+        # Resolve SL mode and store params on the order for use at fill time
+        sl_mode = strategy.get('trailingSL', 'code')  # code | signal | ltp | fixed
+        sl_points = strategy.get('slFixed') or 5       # points away (for 'fixed' mode)
+
+        # For 'signal' mode: gap = entry_low - signal stoploss
+        signal_stoploss = signal.get('stoploss')   # parsed from Telegram message
+        entry_low = signal.get('entry_low', 0)
+        entry_high = signal.get('entry_high', 0)
+        sl_gap = None
+        if sl_mode == 'signal' and signal_stoploss and entry_low:
+            sl_gap = float(entry_low) - float(signal_stoploss)
+            if sl_gap <= 0:
+                log.warning(f"Signal SL gap <= 0 ({sl_gap}), falling back to code mode")
+                sl_mode = 'code'
+                sl_gap = None
+
+        # ── Resolve entry price from entryLogic strategy ──
+        entry_logic = strategy.get('entryLogic', 'code')
+        avg_pick = strategy.get('entryAvgPick', 'avg')  # 'low' | 'avg' | 'high'
+
+        if entry_logic == 'fixed' and strategy.get('entryFixed'):
+            order_price = float(strategy['entryFixed'])
+            log.info(f"Entry mode=fixed: price={order_price}")
+        elif entry_logic == 'avg_signal':
+            hi = float(entry_high or 0)
+            lo = float(entry_low or 0)
+            if avg_pick == 'low':
+                order_price = lo
+            elif avg_pick == 'high':
+                order_price = hi
+            else:  # 'avg'
+                order_price = (lo + hi) / 2.0 if (lo and hi) else (lo or hi)
+            log.info(f"Entry mode=avg_signal ({avg_pick}): price={order_price}")
+        else:  # 'code' — default: use entry_high (bounce fills from top of range down)
+            order_price = float(entry_high or entry_low or 0)
+            log.info(f"Entry mode=code: price={order_price}")
 
         order = {
             "signal_id": signal_id,
@@ -97,16 +135,20 @@ class PaperTrader:
             "transaction_type": "B",
             "order_type": "L",
             "quantity": qty,
-            "price": signal.get("entry_high", signal.get("entry_low", 0)),
+            "price": order_price,
             "trigger_price": 0,
             "status": "pending",
             "order_id": f"PAPER-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{signal_id}",
-            "notes": f"Paper BUY {signal['strike']} {signal['option_type']} @ {signal.get('entry_low')}-{signal.get('entry_high')}",
-            "entry_low": signal.get("entry_low", 0),
-            "entry_high": signal.get("entry_high", 0),
+            "notes": f"Paper BUY {signal['strike']} {signal['option_type']} @ {signal.get('entry_low')}-{signal.get('entry_high')} [{entry_logic}]",
+            "entry_low": entry_low,
+            "entry_high": entry_high,
             "strike": signal.get("strike"),
             "option_type": signal.get("option_type"),
-            "created_at": datetime.now(timezone.utc),  # For 10-min entry timeout
+            "created_at": datetime.now(timezone.utc),
+            # SL strategy params — baked in at order time, applied at fill time
+            "sl_mode": sl_mode,
+            "sl_gap": sl_gap,
+            "sl_points": float(sl_points),
         }
 
         # Save to DB
@@ -115,7 +157,7 @@ class PaperTrader:
 
         # Always queue as pending — real market ticks will trigger the bounce-entry fill
         self._pending_orders.append(order)
-        log.info(f"Paper order pending: {order['trading_symbol']} — waiting for LTP in [{order['entry_low']}, {order['entry_high']}]")
+        log.info(f"Paper order pending: {order['trading_symbol']} — SL mode: {sl_mode} — waiting for LTP in [{order['entry_low']}, {order['entry_high']}]")
 
         if not self.market_feed or not self.market_feed.is_running:
             log.warning("Market feed not running — order will stay pending until feed connects")
@@ -258,50 +300,76 @@ class PaperTrader:
                 self._pending_orders.remove(order)
 
     async def _process_position_tick(self, pos: dict, ltp: float):
-        """Internal logic for updating a single position on a tick."""
-        if ltp <= 0: return
-        
+        """Update trailing SL and PNL for a single position on each tick."""
+        if ltp <= 0:
+            return
+
         pos["current_price"] = ltp
         pos["pnl"] = (ltp - pos["entry_price"]) * pos["quantity"]
+        sl_mode = pos.get("sl_mode", "code")
 
-        # --- Trailing SL Strategy ---
-        # 1. Update Max LTP tracking
-        if ltp > pos.get("max_ltp", 0):
-            pos["max_ltp"] = ltp
-            
-            # 2. Stepped SL: For every 2 points max_ltp moves up from entry, move SL up by 2
-            entry_price = pos["entry_price"]
-            steps = int((ltp - entry_price) // 2)
-            if steps > 0:
-                initial_sl_offset = max(5.0, 0.03 * entry_price)
-                new_sl = (entry_price - initial_sl_offset) + (steps * 2)
-                
-                # SL cannot move downwards
-                if new_sl > pos.get("trailing_sl", 0):
-                    pos["trailing_sl"] = new_sl
-                    log.info(f"Trailing SL moved UP to {new_sl:.2f} for {pos['trading_symbol']}")
-                    await self._broadcast("position_update", {
-                        "id": pos["id"],
-                        "trailing_sl": new_sl,
-                        "max_ltp": ltp,
-                        "status_note": f"SL Trailed to {new_sl:.2f}"
-                    })
+        new_sl = None
 
-        # 3. Check for SL Hit
+        if sl_mode == "ltp":
+            # ── Last LTP mode: SL trails to previous tick's LTP ──
+            # On every tick, SL = last seen LTP (1 tick behind)
+            prev = pos.get("prev_ltp", pos["entry_price"])
+            new_sl = prev  # SL advances to where we just were
+            pos["prev_ltp"] = ltp
+            if ltp > pos.get("max_ltp", 0):
+                pos["max_ltp"] = ltp
+
+        elif sl_mode == "signal":
+            # ── Signal gap mode: maintain constant gap below LTP peak ──
+            # gap = entry_low - signal_stoploss (computed at order time)
+            sl_gap = pos.get("sl_gap") or 30.0
+            if ltp > pos.get("max_ltp", 0):
+                pos["max_ltp"] = ltp
+                new_sl = ltp - sl_gap
+        
+        elif sl_mode == "fixed":
+            # ── Points away mode: trail by N pts below LTP peak ──
+            sl_points = pos.get("sl_points", 5.0)
+            if ltp > pos.get("max_ltp", 0):
+                pos["max_ltp"] = ltp
+                new_sl = ltp - sl_points
+
+        else:  # 'code' (default) — stepped 2pt trailing
+            # ── Code mode: step SL up by 2pts for every 2pts gain ──
+            if ltp > pos.get("max_ltp", 0):
+                pos["max_ltp"] = ltp
+                entry_price = pos["entry_price"]
+                steps = int((ltp - entry_price) // 2)
+                if steps > 0:
+                    initial_sl_offset = max(5.0, 0.03 * entry_price)
+                    new_sl = (entry_price - initial_sl_offset) + (steps * 2)
+
+        # Apply new SL (only ever moves UP)
+        if new_sl is not None:
+            current_sl = pos.get("trailing_sl", 0)
+            if new_sl > current_sl:
+                pos["trailing_sl"] = new_sl
+                log.info(f"[{sl_mode}] SL → {new_sl:.2f} for {pos['trading_symbol']}")
+                await self._broadcast("position_update", {
+                    "id": pos["id"],
+                    "trailing_sl": new_sl,
+                    "max_ltp": pos.get("max_ltp", ltp),
+                    "status_note": f"SL trailed to {new_sl:.2f} [{sl_mode}]"
+                })
+
+        # Check SL hit
         if ltp <= pos.get("trailing_sl", 0):
-            log.warning(f"STOP LOSS HIT for {pos['trading_symbol']} @ {ltp} (SL was {pos['trailing_sl']:.2f})")
+            log.warning(f"STOP LOSS HIT [{sl_mode}]: {pos['trading_symbol']} @ {ltp} (SL was {pos['trailing_sl']:.2f})")
             result = await self.close_position(pos["id"], exit_price=ltp)
-            pos["status"] = "closed" # Signal removal from active list
+            pos["status"] = "closed"
             await self._broadcast("new_trade", {**result, "status": "closed", "trading_symbol": pos["trading_symbol"]})
         else:
-            # Normal update
             await db.update_position(pos["id"], {
                 "current_price": ltp,
                 "pnl": pos["pnl"],
-                "max_ltp": pos["max_ltp"],
+                "max_ltp": pos.get("max_ltp", ltp),
                 "trailing_sl": pos["trailing_sl"],
             })
-            # Broadast position update for live PNL display
             await self._broadcast("position_update", {
                 "id": pos["id"],
                 "current_price": ltp,
@@ -309,12 +377,30 @@ class PaperTrader:
             })
 
     async def _fill_order(self, order: dict, fill_price: float) -> dict:
-        """Fill a paper order at the given price and set initial SL."""
+        """Fill a paper order at the given price and set initial SL based on strategy mode."""
         trade_id = order.get("trade_id")
+        sl_mode = order.get("sl_mode", "code")
+        sl_gap = order.get("sl_gap")       # for 'signal' mode
+        sl_points = order.get("sl_points", 5.0)  # for 'fixed' (points) mode
 
-        # Calculate initial Stop Loss: fill_price - max(5, 3%)
-        sl_points = max(5.0, 0.03 * fill_price)
-        initial_sl = fill_price - sl_points
+        # ── Calculate initial Stop Loss by mode ──
+        if sl_mode == "signal" and sl_gap is not None:
+            # Constant gap trailing: SL = fill_price - gap (gap derived from signal)
+            initial_sl = fill_price - sl_gap
+            log.info(f"SL mode=signal: gap={sl_gap:.2f}, initial SL={initial_sl:.2f}")
+        elif sl_mode == "ltp":
+            # SL starts at fill price (break-even immediately), trails tick-by-tick
+            initial_sl = fill_price
+            log.info(f"SL mode=ltp: SL starts at fill price {fill_price}")
+        elif sl_mode == "fixed":
+            # N points below fill price, trails by same N points
+            initial_sl = fill_price - sl_points
+            log.info(f"SL mode=fixed ({sl_points}pts): initial SL={initial_sl:.2f}")
+        else:  # 'code' (default)
+            # Stepped SL: fill_price - max(5, 3%)
+            sl_points_code = max(5.0, 0.03 * fill_price)
+            initial_sl = fill_price - sl_points_code
+            log.info(f"SL mode=code: initial SL={initial_sl:.2f}")
 
         # Update trade in DB
         await db.update_trade(trade_id, {
@@ -323,7 +409,7 @@ class PaperTrader:
             "fill_time": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         })
 
-        # Create position
+        # Create position — store sl_mode and params so trailing logic is locked per-position
         pos_data = {
             "mode": "paper",
             "trading_symbol": order["trading_symbol"],
@@ -333,20 +419,25 @@ class PaperTrader:
             "entry_price": fill_price,
             "max_ltp": fill_price,
             "trailing_sl": initial_sl,
+            # Strategy params — immutable per position
+            "sl_mode": sl_mode,
+            "sl_gap": sl_gap,
+            "sl_points": sl_points,
+            "prev_ltp": fill_price,   # for 'ltp' mode
         }
         position_id = await db.save_position(trade_id, pos_data)
 
         position = {
-            **pos_data, 
-            "id": position_id, 
-            "trade_id": trade_id, 
-            "current_price": fill_price, 
+            **pos_data,
+            "id": position_id,
+            "trade_id": trade_id,
+            "current_price": fill_price,
             "pnl": 0,
             "opened_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
 
         self._open_positions.append(position)
-        log.info(f"Position opened with Initial SL: {initial_sl:.2f}")
+        log.info(f"Position opened | mode={sl_mode} | Entry={fill_price} | Initial SL={initial_sl:.2f}")
 
         # Fire callbacks
         trade = {**order, "status": "filled", "fill_price": fill_price}
@@ -356,11 +447,10 @@ class PaperTrader:
             except Exception as e:
                 log.error(f"Fill callback error: {e}")
 
-        # Ensure the broadcast message includes the full position for the front-end
         return {
-            "status": "filled", 
-            "trade_id": trade_id, 
-            "fill_price": fill_price, 
+            "status": "filled",
+            "trade_id": trade_id,
+            "fill_price": fill_price,
             "position_id": position_id,
             **position
         }

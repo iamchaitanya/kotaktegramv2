@@ -1088,8 +1088,25 @@ header {
     }
 
     .connection-badges {
-        display: none;
+        display: flex;
+        gap: 4px;
     }
+
+    .badge {
+        padding: 4px 6px;
+        font-size: 0 !important; /* hide raw text nodes */
+        min-width: 28px;
+        justify-content: center;
+    }
+
+    .badge span.badge-dot {
+        font-size: 10px; /* keep dot visible */
+        margin-right: 0;
+    }
+
+    #badge-telegram::after { content: 'T'; font-size: 10px; font-weight: bold; margin-left: 4px; }
+    #badge-kotak::after    { content: 'K'; font-size: 10px; font-weight: bold; margin-left: 4px; }
+    #badge-ws::after       { content: 'S'; font-size: 10px; font-weight: bold; margin-left: 4px; }
 
     /* Show hamburger, hide inline menu */
     .hamburger-btn {
@@ -1139,12 +1156,82 @@ header {
     }
 
     .header-menu .icon-btn {
-        display: none; /* Hide icon buttons on mobile, they repeat hamburger functionality */
+        width: 100%;
+        height: 44px;
+        justify-content: flex-start;
+        padding: 0 14px;
+        gap: 10px;
+        font-size: 14px;
+        border-radius: var(--radius);
     }
+
+    .header-menu .icon-btn::after {
+        /* Show a label for each icon button in mobile menu */
+        font-size: 13px;
+        font-weight: 600;
+    }
+
+    #btn-clear::after    { content: 'Clear Dashboard'; }
+    #btn-refresh::after  { content: 'Hard Refresh'; }
+    #btn-strategy::after { content: 'Strategy Setup'; }
+    #btn-settings::after { content: 'Settings'; }
 
     .panel-positions {
         grid-column: 1 / -1;
     }
+
+    /* Collapsible Panels */
+    .panel-toggle {
+        display: flex !important;
+    }
+
+    .panel.collapsed {
+        min-height: 0;
+        height: auto;
+    }
+
+    .panel.collapsed .panel-body,
+    .panel.collapsed .pnl-banner {
+        display: none;
+    }
+
+    .panel.collapsed .panel-toggle {
+        transform: rotate(-90deg);
+    }
+
+    .panel-header {
+        cursor: pointer;
+    }
+
+    .header-actions {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }
+
+    .panel-toggle {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        background: transparent;
+        border: none;
+        color: var(--text-muted);
+        font-size: 10px;
+        cursor: pointer;
+        transition: transform var(--transition);
+        pointer-events: none; /* Let the header handle the click */
+    }
+}
+
+/* Base state (Desktop) - Keep hidden */
+.panel-toggle {
+    display: none;
+}
+
+.panel-toggle:hover {
+    color: var(--text-primary);
 }
 
 /* ── Strategy Tags & Status ── */
@@ -1220,4 +1307,249 @@ header {
     0% { color: var(--amber); }
     50% { color: var(--green); }
     100% { color: var(--green); }
+}
+
+/* ── Strategy Modal ── */
+.modal-strategy {
+    width: 560px;
+    max-height: 92vh;
+    overflow-y: auto;
+}
+
+.modal-strategy::-webkit-scrollbar {
+    width: 4px;
+}
+.modal-strategy::-webkit-scrollbar-thumb {
+    background: var(--border-hover);
+    border-radius: 4px;
+}
+
+.strategy-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+}
+
+.strategy-select {
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 14px;
+    font-weight: 700;
+    width: 90px;
+    cursor: pointer;
+    transition: all var(--transition);
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2394a3b8' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    padding-right: 30px;
+}
+
+.strategy-select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+/* ── Lot Quick-Pick Pills ── */
+.lot-pills {
+    display: flex;
+    gap: 8px;
+}
+
+.pill-option {
+    position: relative;
+    cursor: pointer;
+}
+
+.pill-option input[type="radio"] {
+    position: absolute;
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.pill-option span {
+    display: inline-flex;
+    align-items: center;
+    padding: 7px 16px;
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--text-muted);
+    background: var(--bg-card);
+    cursor: pointer;
+    transition: all var(--transition);
+    white-space: nowrap;
+    font-family: var(--font-mono);
+    letter-spacing: 0.3px;
+}
+
+.pill-option span:hover {
+    border-color: var(--accent);
+    color: var(--accent-light);
+    background: var(--accent-glow);
+}
+
+.pill-option input[type="radio"]:checked + span {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+    box-shadow: 0 0 12px var(--accent-glow), 0 2px 8px rgba(99, 102, 241, 0.4);
+}
+
+/* ── Strategy Options (Entry / SL) ── */
+.strategy-options {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.strategy-option {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    cursor: pointer;
+    transition: all var(--transition);
+}
+
+.strategy-option:hover {
+    border-color: var(--border-hover);
+    background: var(--bg-card-hover);
+}
+
+.strategy-option input[type="radio"] {
+    position: absolute;
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+/* Custom radio circle */
+.strategy-option::before {
+    content: '';
+    flex-shrink: 0;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 2px solid var(--border-hover);
+    background: var(--bg-secondary);
+    margin-top: 2px;
+    transition: all var(--transition);
+    order: -1;
+    min-width: 16px;
+}
+
+.strategy-option:has(input:checked)::before {
+    border-color: var(--accent);
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow), inset 0 0 0 3px var(--bg-secondary);
+}
+
+.strategy-option:has(input:checked) {
+    border-color: rgba(99, 102, 241, 0.4);
+    background: rgba(99, 102, 241, 0.06);
+    box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.2);
+}
+
+.option-content {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.option-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    line-height: 1.3;
+}
+
+.strategy-option:has(input:checked) .option-title {
+    color: var(--accent-light);
+}
+
+.option-desc {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.4;
+}
+
+/* ── Sub-option (Fixed price input) ── */
+.strategy-suboption {
+    padding: 0 14px 4px;
+    margin-top: -4px;
+    animation: slideIn 200ms ease-out;
+}
+
+.strategy-number-input {
+    width: 100%;
+    padding: 9px 14px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    background: rgba(99, 102, 241, 0.08);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 15px;
+    font-weight: 700;
+    transition: all var(--transition);
+    appearance: textfield;
+    -moz-appearance: textfield;
+}
+
+.strategy-number-input:focus {
+    outline: none;
+    border-color: var(--accent-light);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.strategy-number-input::-webkit-inner-spin-button,
+.strategy-number-input::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    appearance: none;
+}
+
+/* Strategy badge in header (active indicator) */
+#btn-strategy.strategy-active {
+    border-color: var(--accent);
+    color: var(--accent-light);
+    background: var(--accent-glow);
+    box-shadow: 0 0 8px var(--accent-glow);
+}
+
+/* sl-box and target-box in signal cards */
+.sl-box, .target-box {
+    background: rgba(239, 68, 68, 0.08);
+    border-radius: var(--radius-sm);
+    padding: 4px 8px;
+}
+
+.target-box {
+    background: rgba(16, 185, 129, 0.08);
+}
+
+/* ── Avg Pick Pills (Entry sub-option) ── */
+.avg-pick-pills {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.suboption-hint {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 6px;
+    line-height: 1.5;
 }

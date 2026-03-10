@@ -36,6 +36,8 @@ async def init_db():
                 entry_low REAL,
                 entry_high REAL,
                 diff REAL,
+                stoploss REAL,
+                targets TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY (message_id) REFERENCES messages(id)
             );
@@ -137,21 +139,23 @@ async def get_messages(limit: int = 100) -> list[dict]:
 
 async def save_signal(message_id: int, parsed: dict) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
+        # Get values once to ensure order matches placeholders
+        status = parsed.get("status")
+        reason = parsed.get("reason")
+        idx = parsed.get("index")
+        strike = parsed.get("strike")
+        option_type = parsed.get("option_type")
+        entry_low = parsed.get("entry_low")
+        entry_high = parsed.get("entry_high")
+        diff = parsed.get("diff")
+        stoploss = parsed.get("stoploss")
+        targets = json.dumps(parsed.get("targets")) if parsed.get("targets") else None
+
         cursor = await db.execute(
             """INSERT INTO signals
-               (message_id, status, reason, idx, strike, option_type, entry_low, entry_high, diff)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                message_id,
-                parsed.get("status"),
-                parsed.get("reason"),
-                parsed.get("index"),
-                parsed.get("strike"),
-                parsed.get("option_type"),
-                parsed.get("entry_low"),
-                parsed.get("entry_high"),
-                parsed.get("diff"),
-            ),
+               (message_id, status, reason, idx, strike, option_type, entry_low, entry_high, diff, stoploss, targets)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (message_id, status, reason, idx, strike, option_type, entry_low, entry_high, diff, stoploss, targets),
         )
         # Mark message as parsed
         await db.execute("UPDATE messages SET parsed = 1 WHERE id = ?", (message_id,))

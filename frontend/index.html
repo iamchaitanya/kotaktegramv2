@@ -48,7 +48,7 @@
                         🔴 Real
                     </button>
                 </div>
-                <div class="lot-control">
+                <div class="lot-control" style="display:none;">
                     <label for="lot-input">Lots:</label>
                     <input type="number" id="lot-input" min="1" max="100" value="1" class="lot-input">
                     <button class="btn btn-sm btn-secondary" id="btn-set-lots">Set</button>
@@ -56,6 +56,7 @@
                 <button class="btn btn-kill" id="btn-kill" title="Square off ALL positions">🛑 Kill All</button>
                 <button class="icon-btn" id="btn-clear" title="Clear Dashboard Data" style="color: #ef4444;">🗑️</button>
                 <button class="icon-btn" id="btn-refresh" title="Hard Refresh" onclick="location.reload(true)">🔄</button>
+                <button class="icon-btn" id="btn-strategy" title="Strategy Setup">🎯</button>
                 <button class="icon-btn" id="btn-settings" title="Settings">⚙️</button>
             </div>
         </div>
@@ -65,9 +66,12 @@
     <main id="dashboard">
         <!-- Left: Telegram Messages -->
         <section class="panel panel-messages" id="panel-messages">
-            <div class="panel-header">
+            <div class="panel-header" id="header-messages">
                 <h2>📨 Telegram Messages</h2>
-                <span class="panel-count" id="msg-count">0</span>
+                <div class="header-actions">
+                    <span class="panel-count" id="msg-count">0</span>
+                    <button class="panel-toggle" aria-label="Toggle Panel">▼</button>
+                </div>
             </div>
             <div class="panel-body" id="messages-list">
                 <div class="empty-state">Waiting for messages...</div>
@@ -76,9 +80,12 @@
 
         <!-- Center: Parsed Signals -->
         <section class="panel panel-signals" id="panel-signals">
-            <div class="panel-header">
+            <div class="panel-header" id="header-signals">
                 <h2>🎯 Parsed Signals</h2>
-                <span class="panel-count" id="signal-count">0</span>
+                <div class="header-actions">
+                    <span class="panel-count" id="signal-count">0</span>
+                    <button class="panel-toggle" aria-label="Toggle Panel">▼</button>
+                </div>
             </div>
             <div class="panel-body" id="signals-list">
                 <div class="empty-state">No signals parsed yet</div>
@@ -87,9 +94,12 @@
 
         <!-- Right: Positions & P&L -->
         <section class="panel panel-positions" id="panel-positions">
-            <div class="panel-header">
+            <div class="panel-header" id="header-positions">
                 <h2>📊 Positions</h2>
-                <span class="panel-count" id="pos-count">0</span>
+                <div class="header-actions">
+                    <span class="panel-count" id="pos-count">0</span>
+                    <button class="panel-toggle" aria-label="Toggle Panel">▼</button>
+                </div>
             </div>
             <div class="pnl-banner" id="pnl-banner">
                 <div class="pnl-label">Unrealized P&L</div>
@@ -102,7 +112,7 @@
 
         <!-- Bottom: Trade Log -->
         <section class="panel panel-trades" id="panel-trades">
-            <div class="panel-header">
+            <div class="panel-header" id="header-trades">
                 <h2>📋 Trade Log</h2>
                 <div class="trade-filters">
                     <button class="filter-btn active" data-filter="all">All</button>
@@ -110,13 +120,143 @@
                     <button class="filter-btn" data-filter="pending">Pending</button>
                     <button class="filter-btn" data-filter="failed">Failed</button>
                 </div>
-                <span class="panel-count" id="trade-count">0</span>
+                <div class="header-actions">
+                    <span class="panel-count" id="trade-count">0</span>
+                    <button class="panel-toggle" aria-label="Toggle Panel">▼</button>
+                </div>
             </div>
             <div class="panel-body scrollable-x" id="trades-list">
                 <div class="empty-state">No trades yet</div>
             </div>
         </section>
     </main>
+
+    <!-- ── Strategy Modal ── -->
+    <div class="modal-overlay" id="strategy-modal" style="display:none;">
+        <div class="modal modal-strategy">
+            <div class="modal-header">
+                <h2>🎯 Strategy Setup</h2>
+                <button class="modal-close" id="btn-close-strategy">&times;</button>
+            </div>
+            <div class="modal-body">
+
+                <!-- Lots Section -->
+                <div class="settings-section">
+                    <h3>Lots</h3>
+                    <div class="strategy-row">
+                        <select id="strategy-lots-select" class="strategy-select">
+                            <!-- Options 1-50 injected by JS -->
+                        </select>
+                        <div class="lot-pills" id="lot-pills">
+                            <label class="pill-option">
+                                <input type="radio" name="lots-quick" value="1"> <span>1 Lot</span>
+                            </label>
+                            <label class="pill-option">
+                                <input type="radio" name="lots-quick" value="5"> <span>5 Lots</span>
+                            </label>
+                            <label class="pill-option">
+                                <input type="radio" name="lots-quick" value="10"> <span>10 Lots</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Entry Logic Section -->
+                <div class="settings-section">
+                    <h3>Entry Logic</h3>
+                    <div class="strategy-options" id="strategy-entry">
+                        <label class="strategy-option">
+                            <input type="radio" name="entry-logic" value="code">
+                            <div class="option-content">
+                                <span class="option-title">📈 From Code</span>
+                                <span class="option-desc">Bounce-back 5pts from lowest in range</span>
+                            </div>
+                        </label>
+                        <label class="strategy-option">
+                            <input type="radio" name="entry-logic" value="avg_signal">
+                            <div class="option-content">
+                                <span class="option-title">📡 From Signal Range</span>
+                                <span class="option-desc">Enter at a specific point in the signal's range</span>
+                            </div>
+                        </label>
+                        <div class="strategy-suboption" id="entry-avg-row" style="display:none;">
+                            <div class="avg-pick-pills">
+                                <label class="pill-option">
+                                    <input type="radio" name="entry-avg-pick" value="low">
+                                    <span>Low</span>
+                                </label>
+                                <label class="pill-option">
+                                    <input type="radio" name="entry-avg-pick" value="avg" checked>
+                                    <span>Avg</span>
+                                </label>
+                                <label class="pill-option">
+                                    <input type="radio" name="entry-avg-pick" value="high">
+                                    <span>High</span>
+                                </label>
+                            </div>
+                            <p class="suboption-hint">Low = entry_low &nbsp;·&nbsp; Avg = (low+high)/2 &nbsp;·&nbsp; High = entry_high</p>
+                        </div>
+                        <label class="strategy-option">
+                            <input type="radio" name="entry-logic" value="fixed">
+                            <div class="option-content">
+                                <span class="option-title">🔒 Fixed Price</span>
+                                <span class="option-desc">Enter a specific price to buy at</span>
+                            </div>
+                        </label>
+                        <div class="strategy-suboption" id="entry-fixed-row" style="display:none;">
+                            <input type="number" id="entry-fixed-price" class="strategy-number-input" placeholder="e.g. 150" min="1" max="99999">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Trailing SL Section -->
+                <div class="settings-section">
+                    <h3>Trailing Stop-Loss</h3>
+                    <div class="strategy-options" id="strategy-sl">
+                        <label class="strategy-option">
+                            <input type="radio" name="trailing-sl" value="code">
+                            <div class="option-content">
+                                <span class="option-title">⚙️ From Code</span>
+                                <span class="option-desc">Stepped 2pts — SL trails every 2pt move up</span>
+                            </div>
+                        </label>
+                        <label class="strategy-option">
+                            <input type="radio" name="trailing-sl" value="signal">
+                            <div class="option-content">
+                                <span class="option-title">📡 From Signal</span>
+                                <span class="option-desc">Gap = entry_low − signal SL; trail LTP by that fixed gap</span>
+                            </div>
+                        </label>
+                        <label class="strategy-option">
+                            <input type="radio" name="trailing-sl" value="ltp">
+                            <div class="option-content">
+                                <span class="option-title">📉 Last LTP</span>
+                                <span class="option-desc">SL starts at fill price; trails to the previous tick's LTP</span>
+                            </div>
+                        </label>
+                        <label class="strategy-option">
+                            <input type="radio" name="trailing-sl" value="fixed">
+                            <div class="option-content">
+                                <span class="option-title">📏 Points from LTP</span>
+                                <span class="option-desc">Trail SL N pts below LTP peak — enter the point gap</span>
+                            </div>
+                        </label>
+                        <div class="strategy-suboption" id="sl-fixed-row" style="display:none;">
+                            <input type="number" id="sl-fixed-price" class="strategy-number-input" placeholder="e.g. 5 (points)" min="1" max="9999">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" id="btn-strategy-reset">Reset Defaults</button>
+                    <button class="btn btn-primary" id="btn-strategy-save">Save Strategy</button>
+                </div>
+                <p style="font-size:11px; color: var(--text-muted); margin-top: 8px; text-align: center;">
+                    ⚡ Applies to new trades &amp; unfilled pending orders. Open positions keep their original mode.
+                </p>
+            </div>
+        </div>
+    </div>
 
     <!-- ── Settings Modal ── -->
     <div class="modal-overlay" id="settings-modal" style="display:none;">

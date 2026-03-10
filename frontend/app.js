@@ -4,8 +4,8 @@
  * Renders real-time trading dashboard
  */
 
-const API_BASE = window.location.origin;
-const WS_URL = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host + '/ws';
+const API_BASE = 'http://localhost:8000';
+const WS_URL = 'ws://localhost:8000/ws';
 
 // ── State ──
 const state = {
@@ -17,6 +17,14 @@ const state = {
     tradeFilter: 'all',
     wsConnected: false,
     sensex_ltp: 0,
+    strategy: {
+        lots: 1,
+        entryLogic: 'code',  // 'code' | 'avg_signal' | 'fixed'
+        entryAvgPick: 'avg', // 'low' | 'avg' | 'high'  — sub-option for avg_signal
+        entryFixed: null,
+        trailingSL: 'code',  // 'code' | 'signal' | 'ltp' | 'fixed'
+        slFixed: null,
+    },
 };
 
 let ws = null;
@@ -28,6 +36,7 @@ const $$ = (sel) => document.querySelectorAll(sel);
 
 // ── Init ──
 document.addEventListener('DOMContentLoaded', () => {
+    loadStrategy();
     bindEvents();
     connectWebSocket();
     fetchInitialData();
@@ -91,6 +100,17 @@ function bindEvents() {
         $('#settings-modal').style.display = 'none';
     });
 
+    // Panel collapse toggle (mobile only)
+    $$('.panel-header').forEach(header => {
+        header.addEventListener('click', (e) => {
+            if (window.innerWidth <= 768) {
+                const panel = header.closest('.panel');
+                panel.classList.toggle('collapsed');
+                console.log('Panel toggled:', panel.id);
+            }
+        });
+    });
+
     // Clear Dashboard Data
     $('#btn-clear').addEventListener('click', async () => {
         if (confirm("Are you sure you want to completely clear the dashboard?\n\nThis will delete all messages, signals, trades, and positions.\n\nNote: Backtesting ticks will NOT be deleted.")) {
@@ -150,6 +170,9 @@ function bindEvents() {
             if (e.target === overlay) overlay.style.display = 'none';
         });
     });
+
+    // Strategy modal
+    bindStrategyModal();
 }
 
 // ── WebSocket ──
@@ -177,8 +200,16 @@ function connectWebSocket() {
         }
     };
 
+    // Heartbeat to prevent silent connection drops
+    const pingInterval = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping' }));
+        }
+    }, 20000); // 20 seconds
+
     ws.onclose = () => {
         state.wsConnected = false;
+        clearInterval(pingInterval);
         updateBadge('badge-ws', false);
         // Auto-reconnect
         if (!reconnectTimer) {
@@ -224,7 +255,8 @@ function handleWSMessage(msg) {
                 // Deduplicate: replace existing signal for same strike+option_type
                 if (msg.data.strike && msg.data.option_type) {
                     const existingIdx = state.signals.findIndex(s =>
-                        s.strike === msg.data.strike && s.option_type === msg.data.option_type
+                        String(s.strike) === String(msg.data.strike) && 
+                        String(s.option_type).toUpperCase() === String(msg.data.option_type).toUpperCase()
                     );
                     if (existingIdx !== -1) {
                         state.signals.splice(existingIdx, 1);
@@ -239,11 +271,19 @@ function handleWSMessage(msg) {
 
             case 'new_trade':
                 if (msg.data) {
-                    state.trades.unshift(msg.data);
+                    // Upsert: update existing entry if same trade_id, else prepend
+                    const newTradeId = msg.data.trade_id || msg.data.id;
+                    const existingIdx = state.trades.findIndex(t => (t.trade_id || t.id) === newTradeId);
+                    if (existingIdx !== -1) {
+                        state.trades[existingIdx] = { ...state.trades[existingIdx], ...msg.data };
+                    } else {
+                        state.trades.unshift(msg.data);
+                    }
 
                     // If this trade is a fill, add it to positions
                     if (msg.data.status === 'filled') {
-                        if (!state.positions.some(p => p.id === msg.data.id || p.id === msg.data.position_id)) {
+                        const posId = msg.data.position_id || msg.data.id;
+                        if (!state.positions.some(p => p.id === posId)) {
                             state.positions.unshift(msg.data);
                         }
                         // Update matching signal card
@@ -255,12 +295,19 @@ function handleWSMessage(msg) {
                                 renderSignals();
                             }
                         }
+                    } else if (msg.data.status === 'pending' && msg.data.signal_id) {
+                        // New pending order — update signal card to show pending
+                        const sigIdx = state.signals.findIndex(s => s.id === msg.data.signal_id);
+                        if (sigIdx !== -1) {
+                            state.signals[sigIdx].trade_status = 'pending';
+                            renderSignals();
+                        }
                     }
 
                     renderTrades();
                     renderPositions();
-                    const status = msg.data.status || 'pending';
-                    toast(`Trade ${status}: ${msg.data.trading_symbol || ''}`, status === 'filled' ? 'success' : 'info');
+                    const tradeStatus = msg.data.status || 'pending';
+                    toast(`Trade ${tradeStatus}: ${msg.data.trading_symbol || ''}`, tradeStatus === 'filled' ? 'success' : 'info');
                 }
                 break;
 
@@ -270,24 +317,33 @@ function handleWSMessage(msg) {
                 toast(`Mode: ${msg.data.new_mode.toUpperCase()}`, 'warning');
                 break;
 
-            case 'order_update':
-                // Update signal card via signal_id
-                if (msg.data.signal_id) {
-                    const sigIdx = state.signals.findIndex(s => s.id === msg.data.signal_id);
+            case 'order_update': {
+                const upd = msg.data;
+
+                // 1. Update signal card — by signal_id (now always provided by backend)
+                if (upd.signal_id) {
+                    const sigIdx = state.signals.findIndex(s => s.id === upd.signal_id);
                     if (sigIdx !== -1) {
-                        if (msg.data.status) state.signals[sigIdx].trade_status = msg.data.status;
-                        if (msg.data.status_note) state.signals[sigIdx].status_note = msg.data.status_note;
-                        if (msg.data.min_ltp) state.signals[sigIdx].min_ltp = msg.data.min_ltp;
+                        if (upd.status) state.signals[sigIdx].trade_status = upd.status;
+                        if (upd.status_note) state.signals[sigIdx].status_note = upd.status_note;
+                        if (upd.min_ltp) state.signals[sigIdx].min_ltp = upd.min_ltp;
                         renderSignals();
                     }
                 }
-                // Update trade log
-                const trdIdx = state.trades.findIndex(t => t.id === msg.data.id);
+
+                // 2. Update trade log entry by trade id
+                const trdIdx = state.trades.findIndex(t => (t.id === upd.id) || (t.trade_id === upd.id));
                 if (trdIdx !== -1) {
-                    state.trades[trdIdx] = { ...state.trades[trdIdx], ...msg.data };
+                    state.trades[trdIdx] = { ...state.trades[trdIdx], ...upd };
                     renderTrades();
                 }
+
+                // 3. Show a toast for replaced trades
+                if (upd.status === 'replaced') {
+                    toast(`Order replaced: ${upd.trading_symbol || 'trade #' + upd.id}`, 'info');
+                }
                 break;
+            }
 
             case 'instrument_ltp':
                 // Live LTP for any subscribed instrument — update matching signal cards directly
@@ -441,12 +497,21 @@ async function sendTestSignal() {
     if (!text) return toast('Enter a signal message', 'warning');
 
     try {
-        await fetch(`${API_BASE}/api/test-signal`, {
+        const res = await fetch(`${API_BASE}/api/test-signal`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text, sender: 'Test' }),
         });
-        toast('Test signal sent', 'success');
+        const result = await res.json();
+        
+        if (result.signal && result.signal.status === 'valid') {
+            toast('Test signal sent and validated!', 'success');
+        } else if (result.signal && result.signal.status === 'ignored') {
+            toast(`Signal ignored: ${result.signal.reason}`, 'warning');
+        } else {
+            toast('Test signal sent', 'success');
+        }
+        
         $('#test-signal-input').value = '';
     } catch (e) {
         toast('Failed to send test', 'error');
@@ -510,13 +575,36 @@ function renderMessages() {
         return;
     }
 
-    container.innerHTML = state.messages.map(m => `
-        <div class="msg-bubble">
+    // Clear empty state if present
+    if (container.querySelector('.empty-state')) container.innerHTML = '';
+
+    // Rebuild only the DOM elements that don't exist
+    // For simplicity in this logic, we'll still clear and rebuild BUT 
+    // we use DocumentFragment to minimize flicker. 
+    // However, the best anti-flicker is to only add what's new.
+    
+    // Check if we already have these messages rendered
+    const currentIds = new Set([...container.querySelectorAll('.msg-bubble')].map(el => el.dataset.id));
+    
+    const fragment = document.createDocumentFragment();
+    state.messages.forEach(m => {
+        const id = m.id || m.timestamp;
+        if (currentIds.has(String(id))) return;
+
+        const div = document.createElement('div');
+        div.className = 'msg-bubble';
+        div.dataset.id = id;
+        div.innerHTML = `
             <div class="msg-sender">${esc(m.sender || 'Unknown')}</div>
             <div class="msg-text">${esc(m.raw_text || m.text || '')}</div>
             <div class="msg-time">${formatTime(m.timestamp || m.created_at)}</div>
-        </div>
-    `).join('');
+        `;
+        fragment.appendChild(div);
+    });
+
+    if (fragment.children.length > 0) {
+        container.prepend(fragment);
+    }
 }
 
 function renderSignals() {
@@ -531,57 +619,76 @@ function renderSignals() {
             return;
         }
 
-        container.innerHTML = state.signals.map(s => {
+        if (container.querySelector('.empty-state')) container.innerHTML = '';
+
+        state.signals.forEach(s => {
+            const existing = document.getElementById(`signal-card-${s.id}`);
             const status = s.status || 'empty';
             const isValid = status === 'valid';
             const tradeStatus = s.trade_status || '';
-
-            let details = '';
-            if (isValid) {
-                const ltpVal = s.live_ltp ? `₹${s.live_ltp.toFixed(2)}` : '--';
-                const sensexVal = state.sensex_ltp ? state.sensex_ltp.toFixed(2) : '--';
-                
-                const ltpStr = `<div><span class="label">LTP</span><br><span class="value ltp-live" id="signal-ltp-${s.id}">${ltpVal}</span></div>`;
-                const sensexStr = `<div><span class="label">SENSEX</span><br><span class="value ltp-live signal-sensex-ltp">${sensexVal}</span></div>`;
-                
-                details = `
-                    <div class="signal-details">
-                        <div><span class="label">Index</span><br><span class="value">${esc(s.idx || s.index || '')}</span></div>
-                        <div><span class="label">Type</span><br><span class="value">${esc(s.option_type || '')}</span></div>
-                        <div><span class="label">Strike</span><br><span class="value">${esc(s.strike || '')}</span></div>
-                        <div><span class="label">Entry</span><br><span class="value">₹${s.entry_low || 0} - ₹${s.entry_high || 0}</span></div>
-                        ${sensexStr}
-                        ${ltpStr}
-                        ${s.min_ltp ? `<div><span class="label">Min LTP</span><br><span class="value">₹${s.min_ltp}</span></div>` : ''}
-                    </div>
-                `;
-            }
-
-            const tradeTag = tradeStatus && tradeStatus !== 'valid' 
-                ? `<span class="signal-status ${tradeStatus}">${tradeStatus}</span>` 
-                : '';
-
             const timerStart = s.created_at || s.timestamp;
-            let timerTag = '';
-            if (isValid && timerStart && !['filled', 'closed', 'replaced', 'expired'].includes(tradeStatus)) {
-                timerTag = `<span class="timer-tag" data-timer-start="${timerStart}" data-timer-mins="10" data-timer-label="Entry">⏳ Entry: --:--</span>`;
-            }
 
-            return `
-                <div class="signal-card ${tradeStatus || s.status}" id="signal-card-${s.id}">
+            const ltpVal = s.live_ltp ? `₹${s.live_ltp.toFixed(2)}` : '--';
+            const sensexVal = state.sensex_ltp ? state.sensex_ltp.toFixed(2) : '--';
+
+
+
+            // Extract targets display
+            let targetsText = '--';
+            if (s.targets && Array.isArray(s.targets) && s.targets.length > 0) {
+                targetsText = s.targets.map(t => '₹' + t).join(', ');
+            } else if (typeof s.targets === 'string' && s.targets) {
+                try {
+                    const tArr = JSON.parse(s.targets);
+                    if (Array.isArray(tArr) && tArr.length > 0) {
+                        targetsText = tArr.map(t => '₹' + t).join(', ');
+                    }
+                } catch(e) {}
+            }
+            const targetsHtml = `<div><span class="label">Targets</span><br><span class="value">${targetsText}</span></div>`;
+
+            const cardHtml = `
                     <div style="display: flex; justify-content: space-between; align-items: start;">
                         <span class="signal-status ${s.status}">${s.status}</span>
                         <div style="display: flex; gap: 6px; align-items: center;">
-                            ${timerTag}
-                            ${tradeTag}
+                            ${isValid && timerStart && !['filled', 'closed', 'replaced', 'expired'].includes(tradeStatus) 
+                                ? `<span class="timer-tag" data-timer-start="${timerStart}" data-timer-mins="10" data-timer-label="Entry">⏳ Entry: --:--</span>` 
+                                : ''}
+                            ${tradeStatus && tradeStatus !== 'valid' ? `<span class="signal-status ${tradeStatus}">${tradeStatus}</span>` : ''}
                         </div>
                     </div>
                     ${s.status_note ? `<div class="signal-note">ℹ️ ${esc(s.status_note)}</div>` : ''}
                     ${s.reason ? `<div class="signal-reason">${esc(s.reason)}</div>` : ''}
-                    ${details}
-                </div>
+                    ${isValid ? `
+                        <div class="signal-details">
+                            <div><span class="label">Index</span><br><span class="value">${esc(s.idx || s.index || '')}</span></div>
+                            <div><span class="label">Type</span><br><span class="value">${esc(s.option_type || '')}</span></div>
+                            <div><span class="label">Strike</span><br><span class="value">${esc(s.strike || '')}</span></div>
+                            <div><span class="label">Entry</span><br><span class="value">₹${s.entry_low || 0} - ₹${s.entry_high || 0}</span></div>
+                            <div><span class="label">SENSEX</span><br><span class="value ltp-live signal-sensex-ltp">${sensexVal}</span></div>
+                            <div><span class="label">LTP</span><br><span class="value ltp-live" id="signal-ltp-${s.id}">${ltpVal}</span></div>
+                            ${s.min_ltp ? `<div><span class="label">Min LTP</span><br><span class="value">₹${s.min_ltp}</span></div>` : ''}
+                            ${s.stoploss ? `<div><span class="label">SL</span><br><span class="value">₹${s.stoploss}</span></div>` : ''}
+                            ${targetsHtml}
+                        </div>
+                    ` : ''}
             `;
-        }).join('');
+
+            if (existing) {
+                // Determine if we need to update content
+                // For simplicity, update innerHTML if basically anything changed 
+                // but keep the element ID to avoid jumpiness
+                existing.className = `signal-card ${tradeStatus || s.status}`;
+                existing.innerHTML = cardHtml;
+            } else {
+                const div = document.createElement('div');
+                div.id = `signal-card-${s.id}`;
+                div.className = `signal-card ${tradeStatus || s.status}`;
+                div.innerHTML = cardHtml;
+                // Insertion logic (signals are usually in order)
+                container.prepend(div);
+            }
+        });
     } catch (err) {
         console.error("Error in renderSignals:", err);
     }
@@ -786,4 +893,235 @@ function toast(message, type = 'info') {
     el.textContent = message;
     container.appendChild(el);
     setTimeout(() => el.remove(), 4000);
+}
+
+// ── Strategy Modal Logic ──
+
+const STRATEGY_DEFAULTS = {
+    lots: 1,
+    entryLogic: 'code',
+    entryAvgPick: 'avg',
+    entryFixed: null,
+    trailingSL: 'code',
+    slFixed: null,
+};
+
+function loadStrategy() {
+    try {
+        const saved = localStorage.getItem('tradebridge_strategy');
+        if (saved) {
+            const parsed = JSON.parse(saved);
+            state.strategy = { ...STRATEGY_DEFAULTS, ...parsed };
+        } else {
+            state.strategy = { ...STRATEGY_DEFAULTS };
+        }
+    } catch (e) {
+        state.strategy = { ...STRATEGY_DEFAULTS };
+    }
+    updateStrategyButtonBadge();
+}
+
+function persistStrategy() {
+    localStorage.setItem('tradebridge_strategy', JSON.stringify(state.strategy));
+    updateStrategyButtonBadge();
+}
+
+function updateStrategyButtonBadge() {
+    const btn = $('#btn-strategy');
+    if (!btn) return;
+    const isDefault = (
+        state.strategy.lots === 1 &&
+        state.strategy.entryLogic === 'code' &&
+        state.strategy.trailingSL === 'code'
+    );
+    btn.classList.toggle('strategy-active', !isDefault);
+    btn.title = isDefault
+        ? 'Strategy Setup'
+        : `Strategy: ${state.strategy.lots} lot(s) | Entry: ${state.strategy.entryLogic} | SL: ${state.strategy.trailingSL}`;
+}
+
+function syncStrategyModalToState() {
+    const s = state.strategy;
+
+    // Lots dropdown
+    const sel = $('#strategy-lots-select');
+    if (sel) sel.value = s.lots;
+
+    // Lot pills
+    $$('input[name="lots-quick"]').forEach(r => {
+        r.checked = parseInt(r.value) === s.lots;
+    });
+
+    // Entry logic
+    $$('input[name="entry-logic"]').forEach(r => {
+        r.checked = r.value === s.entryLogic;
+    });
+    const entryFixedRow = $('#entry-fixed-row');
+    if (entryFixedRow) entryFixedRow.style.display = s.entryLogic === 'fixed' ? 'block' : 'none';
+    const entryAvgRow = $('#entry-avg-row');
+    if (entryAvgRow) entryAvgRow.style.display = s.entryLogic === 'avg_signal' ? 'block' : 'none';
+    const entryFixedInput = $('#entry-fixed-price');
+    if (entryFixedInput && s.entryFixed) entryFixedInput.value = s.entryFixed;
+    // Restore avg sub-pick
+    $$('input[name="entry-avg-pick"]').forEach(r => {
+        r.checked = r.value === (s.entryAvgPick || 'avg');
+    });
+
+    // Trailing SL
+    $$('input[name="trailing-sl"]').forEach(r => {
+        r.checked = r.value === s.trailingSL;
+    });
+    const slFixedRow = $('#sl-fixed-row');
+    if (slFixedRow) slFixedRow.style.display = s.trailingSL === 'fixed' ? 'block' : 'none';
+    const slFixedInput = $('#sl-fixed-price');
+    if (slFixedInput && s.slFixed) slFixedInput.value = s.slFixed;
+}
+
+function populateLotDropdown() {
+    const sel = $('#strategy-lots-select');
+    if (!sel || sel.options.length > 0) return;
+    for (let i = 1; i <= 50; i++) {
+        const opt = document.createElement('option');
+        opt.value = i;
+        opt.textContent = `${i} Lot${i > 1 ? 's' : ''}`;
+        sel.appendChild(opt);
+    }
+}
+
+function bindStrategyModal() {
+    // Open button
+    const btnStrategy = $('#btn-strategy');
+    if (btnStrategy) {
+        btnStrategy.addEventListener('click', () => {
+            populateLotDropdown();
+            syncStrategyModalToState();
+            $('#strategy-modal').style.display = 'flex';
+        });
+    }
+
+    // Close button
+    const btnClose = $('#btn-close-strategy');
+    if (btnClose) btnClose.addEventListener('click', () => {
+        $('#strategy-modal').style.display = 'none';
+    });
+
+    // Lots dropdown change
+    const lotsSelect = $('#strategy-lots-select');
+    if (lotsSelect) {
+        lotsSelect.addEventListener('change', () => {
+            const val = parseInt(lotsSelect.value);
+            // Deselect pills if not 1/5/10
+            $$('input[name="lots-quick"]').forEach(r => {
+                r.checked = parseInt(r.value) === val;
+            });
+            // Also sync header lot-input
+            const lotInput = $('#lot-input');
+            if (lotInput) lotInput.value = val;
+        });
+    }
+
+    // Lot pill clicks
+    $$('input[name="lots-quick"]').forEach(radio => {
+        radio.addEventListener('change', () => {
+            const val = parseInt(radio.value);
+            const sel = $('#strategy-lots-select');
+            if (sel) sel.value = val;
+            const lotInput = $('#lot-input');
+            if (lotInput) lotInput.value = val;
+        });
+    });
+
+    // Entry Logic radios — show/hide fixed or avg-pick row
+    $$('input[name="entry-logic"]').forEach(radio => {
+        radio.addEventListener('change', () => {
+            const fixedRow = $('#entry-fixed-row');
+            const avgRow = $('#entry-avg-row');
+            if (fixedRow) fixedRow.style.display = radio.value === 'fixed' ? 'block' : 'none';
+            if (avgRow) avgRow.style.display = radio.value === 'avg_signal' ? 'block' : 'none';
+        });
+    });
+
+    // Trailing SL radios — show/hide fixed input
+    $$('input[name="trailing-sl"]').forEach(radio => {
+        radio.addEventListener('change', () => {
+            const fixedRow = $('#sl-fixed-row');
+            if (fixedRow) fixedRow.style.display = radio.value === 'fixed' ? 'block' : 'none';
+        });
+    });
+
+    // Reset button
+    const btnReset = $('#btn-strategy-reset');
+    if (btnReset) {
+        btnReset.addEventListener('click', () => {
+            state.strategy = { ...STRATEGY_DEFAULTS };
+            populateLotDropdown();
+            syncStrategyModalToState();
+            const lotInput = $('#lot-input');
+            if (lotInput) lotInput.value = 1;
+            persistStrategy();
+            toast('Strategy reset to defaults', 'info');
+        });
+    }
+
+    // Save button
+    const btnSave = $('#btn-strategy-save');
+    if (btnSave) {
+        btnSave.addEventListener('click', async () => {
+            // Read current values from modal
+            const sel = $('#strategy-lots-select');
+            const lots = sel ? parseInt(sel.value) : 1;
+
+            const entryRadio = document.querySelector('input[name="entry-logic"]:checked');
+            const entryLogic = entryRadio ? entryRadio.value : 'code';
+            const entryFixedVal = entryLogic === 'fixed' ? (parseFloat($('#entry-fixed-price')?.value) || null) : null;
+            const avgPickRadio = document.querySelector('input[name="entry-avg-pick"]:checked');
+            const entryAvgPick = entryLogic === 'avg_signal' ? (avgPickRadio?.value || 'avg') : 'avg';
+
+            const slRadio = document.querySelector('input[name="trailing-sl"]:checked');
+            const trailingSL = slRadio ? slRadio.value : 'code';
+            const slFixedVal = trailingSL === 'fixed' ? (parseFloat($('#sl-fixed-price')?.value) || null) : null;
+
+            if (entryLogic === 'fixed' && !entryFixedVal) {
+                toast('Please enter a fixed entry price', 'warning');
+                return;
+            }
+            if (trailingSL === 'fixed' && !slFixedVal) {
+                toast('Please enter a fixed SL price', 'warning');
+                return;
+            }
+
+            state.strategy = { lots, entryLogic, entryAvgPick, entryFixed: entryFixedVal, trailingSL, slFixed: slFixedVal };
+            persistStrategy();
+
+            // Sync header lot size
+            const lotInput = $('#lot-input');
+            if (lotInput) lotInput.value = lots;
+
+            // Push to backend
+            try {
+                await fetch(`${API_BASE}/api/settings/strategy`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(state.strategy),
+                });
+            } catch (e) {
+                // Non-critical — settings saved locally regardless
+                console.warn('Could not sync strategy to backend:', e);
+            }
+
+            // Also sync lot size to backend
+            try {
+                await fetch(`${API_BASE}/api/settings/lot-size`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ lots }),
+                });
+            } catch (e) {
+                console.warn('Could not sync lot size to backend:', e);
+            }
+
+            toast(`Strategy saved: ${lots} lot(s) | Entry: ${entryLogic} | SL: ${trailingSL}`, 'success');
+            $('#strategy-modal').style.display = 'none';
+        });
+    }
 }

@@ -1,0 +1,39 @@
+# .geminiignore: Exclude Token-Wasting Junk (Python + React)
+
+# React/Frontend
+node_modules/
+.next/
+dist/
+build/
+out/
+coverage/
+storybook-static/
+
+# Python/Backend
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+venv/
+env/
+.venv/
+.env
+
+# General
+logs/
+tmp/
+temp/
+.cache/
+*.log
+*.cache
+.DS_Store
+Thumbs.db
+.git/
+.github/
+.vscode/
+.idea/
+
+# If extras: android/, ios/, Pods/, target/

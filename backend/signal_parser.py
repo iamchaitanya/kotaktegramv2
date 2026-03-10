@@ -24,7 +24,9 @@ class ParsedSignal:
     option_type: Optional[str] = None  # CE / PE
     entry_low: Optional[float] = None
     entry_high: Optional[float] = None
+    targets: Optional[list[float]] = None
     diff: Optional[float] = None
+    stoploss: Optional[float] = None
 
     def to_dict(self):
         return asdict(self)
@@ -41,26 +43,22 @@ def parse_signal(text: str) -> ParsedSignal:
     stripped = text.strip()
     lower = stripped.lower()
 
-    # ── Rule 1: Mandatory "Trading Floor" header (flexible spacing) ──
+    # ── Rule 1: Mandatory "Trading Floor" or "Risky" header (flexible spacing) ──
     # Allow leading non-alphanumeric characters (like ** for bold in Telegram)
-    if not re.match(r"^[\W_]*trading\s*floor", lower):
-        return ParsedSignal(status="ignored", reason='Does not start with "trading floor"')
+    if not re.search(r"(trading\s*floor|risky)", lower):
+        return ParsedSignal(status="ignored", reason='Does not start with "trading floor" or "risky"')
 
     # ── Rule 2: Must contain "sensex" ──
     if "sensex" not in lower:
         return ParsedSignal(status="ignored", reason='Does not contain "sensex"')
 
     # ── Rule 3: Strike price — exactly 5 digits + CE/PE ──
-    option_match = re.search(r"(\d{1,10})\s*(CE|PE)", stripped, re.IGNORECASE)
+    # Improved regex to find 5 digits followed by CE or PE more reliably
+    option_match = re.search(r"(\d{5})\s*(CE|PE)", stripped, re.IGNORECASE)
     if not option_match:
-        return ParsedSignal(status="ignored", reason="Strike/Type not found")
+        return ParsedSignal(status="ignored", reason="Strike (5 digits) + CE/PE not found")
 
     strike = option_match.group(1)
-    if len(strike) != 5:
-        return ParsedSignal(
-            status="ignored",
-            reason=f"Strike length is {len(strike)} (Need 5)",
-        )
     option_type = option_match.group(2).upper()
 
     # ── Rule 4: Entry price range — after "price" keyword ──
@@ -82,6 +80,27 @@ def parse_signal(text: str) -> ParsedSignal:
     if avg_match:
         low = int(avg_match.group(1))
 
+    # ── Rule 5.5: Stoploss extraction ──
+    # Improved to handle "STOPLOSS **415**" or "SL: @200"
+    # Matches label, then skips any non-digits, then captures the price.
+    sl_match = re.search(r"(?:stoploss|sl|stls)[^\d]*(\d{1,5})", stripped, re.IGNORECASE)
+    stoploss = int(sl_match.group(1)) if sl_match else None
+
+    # ── Rule 5.6: Target extraction ──
+    targets = []
+    # Match T1, T2, T3, Target 1, etc.
+    # Updated to handle formats like "T1 280 T2 320" and "Targets: 280, 320"
+    target_pattern = re.compile(r"(?:target|tgt|t)(?:\s*\d+)?\s*[:@\-]?\s*(\d{1,5})", re.IGNORECASE)
+    for tm in target_pattern.finditer(stripped):
+        targets.append(float(tm.group(1)))
+    
+    if not targets:
+        # Also look for a comma/space separated list after "targets:"
+        list_match = re.search(r"targets?\s*[:@\-]?\s*([\d\s,]+)", lower)
+        if list_match:
+            nums = re.findall(r"\d+", list_match.group(1))
+            targets = [float(n) for n in nums if len(n) <= 5]
+
     # ── Rule 6: Validation ──
     if high < low:
         return ParsedSignal(status="ignored", reason="High < Low")
@@ -95,7 +114,9 @@ def parse_signal(text: str) -> ParsedSignal:
         option_type=option_type,
         entry_low=low,
         entry_high=high,
+        targets=targets if targets else None,
         diff=abs(high - low),
+        stoploss=stoploss,
     )
 
 

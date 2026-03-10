@@ -30,36 +30,65 @@ telegram = TelegramListener()
 
 
 # ── WebSocket Connection Manager ──
+def _json_safe(obj):
+    """Recursively convert datetime objects to ISO strings so send_json never crashes."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    elif isinstance(obj, datetime):
+        return obj.isoformat().replace("+00:00", "Z")
+    return obj
+
 class ConnectionManager:
-    """Manages active WebSocket connections."""
+    """Manages active WebSocket connections.
+    Uses per-connection asyncio.Lock to prevent concurrent writes.
+    """
 
     def __init__(self):
-        self.active: list[WebSocket] = []
+        self._connections: dict[WebSocket, asyncio.Lock] = {}
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
-        self.active.append(ws)
-        log.info(f"WS client connected ({len(self.active)} total)")
+        self._connections[ws] = asyncio.Lock()
+        log.info(f"WS client connected ({len(self._connections)} total)")
 
     def disconnect(self, ws: WebSocket):
-        if ws in self.active:
-            self.active.remove(ws)
-        log.info(f"WS client disconnected ({len(self.active)} total)")
+        self._connections.pop(ws, None)
+        log.info(f"WS client disconnected ({len(self._connections)} total)")
+
+    async def send(self, ws: WebSocket, data: dict):
+        """Send data to a specific WebSocket, serialized via its lock."""
+        lock = self._connections.get(ws)
+        if not lock:
+            return
+        async with lock:
+            await ws.send_json(_json_safe(data))
 
     async def broadcast(self, data: dict):
-        """Send JSON to all connected clients."""
+        """Send data to ALL connected WebSocket clients."""
+        safe_data = _json_safe(data)
+        msg_type = data.get("type", "?")
+        n = len(self._connections)
+        if msg_type not in ("instrument_ltp", "index_ltp"):
+            log.info(f"WS broadcast [{msg_type}] to {n} clients")
         dead = []
-        for ws in self.active:
+        for ws, lock in list(self._connections.items()):
             try:
-                await ws.send_json(data)
-            except Exception:
+                async with lock:
+                    await ws.send_json(safe_data)
+            except Exception as e:
+                log.error(f"WS send failed: {e}")
                 dead.append(ws)
         for ws in dead:
             self.disconnect(ws)
 
+    @property
+    def active(self):
+        return list(self._connections.keys())
+
 
 ws_manager = ConnectionManager()
-
 
 # ── App Lifecycle ──
 @asynccontextmanager
@@ -89,10 +118,17 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(timeout_checker())
 
     # Auto-login to Kotak Neo (non-blocking)
-    if Config.KOTAK_CONSUMER_KEY:
+    # Auto-login to Kotak Neo (non-blocking background task)
+    async def kotat_auto_login():
+        if not Config.KOTAK_CONSUMER_KEY:
+            return
+            
         manager.initialize_kotak()
-        log.info("Kotak Neo client initialized — attempting auto-login...")
+        log.info("Kotak Neo client initialized — attempting auto-login in background...")
         try:
+            # Note: manager.login_kotak is a synchronous wrapper around the SDK's login flow
+            # We run it in the main loop for now as it handles its own background threads,
+            # but wrapping it in this async task prevents it from blocking the lifespan 'yield'.
             login_result = manager.login_kotak()
             if login_result.get("status") == "ok":
                 log.info("✅ Kotak Neo auto-login successful!")
@@ -100,38 +136,54 @@ async def lifespan(app: FastAPI):
                 manager.market_feed.start()
                 manager.market_feed.add_tick_callback(manager.paper_trader.on_tick)
 
-                # Broadcast ALL live ticks to frontend
+                # Use an asyncio.Queue to decouple high-frequency Kotak ticks
+                # from the main event loop.
                 SENSEX_INDEX_TOKENS = ["1", "999901", "50060"]
-                async def broadcast_all_ticks(token, ltp, data):
-                    try:
-                        symbol = data.get("symbol", "")
-                        if token in SENSEX_INDEX_TOKENS or symbol == "SENSEX":
-                            await ws_manager.broadcast({"type": "index_ltp", "data": {"symbol": "SENSEX", "ltp": ltp}})
-                        elif symbol:
-                            await ws_manager.broadcast({"type": "instrument_ltp", "data": {"symbol": symbol, "ltp": ltp}})
-                    except Exception as e:
-                        log.error(f"BROADCAST EXCEPTION: {e}")
-                manager.market_feed.add_tick_callback(broadcast_all_ticks)
+                tick_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
+                _main_loop = asyncio.get_running_loop()
 
-                # Wait for SDK's background WS thread to fully connect
+                def enqueue_tick(token, ltp, data):
+                    try:
+                        _main_loop.call_soon_threadsafe(tick_queue.put_nowait, (token, ltp, data))
+                    except Exception:
+                        pass
+
+                manager.market_feed.add_raw_tick_callback(enqueue_tick)
+
+                async def tick_consumer():
+                    while True:
+                        try:
+                            token, ltp, data = await asyncio.wait_for(tick_queue.get(), timeout=1.0)
+                            symbol = data.get("symbol", "")
+                            if token in SENSEX_INDEX_TOKENS or symbol == "SENSEX":
+                                await ws_manager.broadcast({"type": "index_ltp", "data": {"symbol": "SENSEX", "ltp": ltp}})
+                            elif symbol:
+                                await ws_manager.broadcast({"type": "instrument_ltp", "data": {"symbol": symbol, "ltp": ltp}})
+                            tick_queue.task_done()
+                        except asyncio.TimeoutError:
+                            pass
+                        except Exception as e:
+                            log.error(f"Tick consumer error: {e}")
+
+                asyncio.create_task(tick_consumer())
+                log.info("Tick consumer task started")
+
                 await asyncio.sleep(3)
 
-                # Subscribe to SENSEX index — single batch call to avoid multiple WS threads
                 manager.market_feed.subscribe_batch([
                     {"instrument_token": "1", "exchange_segment": "bse_cm", "symbol": "SENSEX"},
                     {"instrument_token": "999901", "exchange_segment": "bse_cm", "symbol": "SENSEX"},
                     {"instrument_token": "50060", "exchange_segment": "bse_cm", "symbol": "SENSEX"},
                 ])
 
-                # Download daily contract master
                 manager.download_contracts()
-
-                # Re-hydrate subscriptions for recently active signal cards
                 await manager.resubscribe_recent_signals(limit=20)
             else:
                 log.warning(f"Kotak auto-login failed: {login_result.get('message')} — use Settings to login manually")
         except Exception as e:
             log.warning(f"Kotak auto-login error: {e} — use Settings to login manually")
+
+    asyncio.create_task(kotat_auto_login())
 
     # Background task: refresh contract master daily at 08:50 IST
     IST = ZoneInfo("Asia/Kolkata")
@@ -209,6 +261,15 @@ class LotSizeRequest(BaseModel):
     lots: int
 
 
+class StrategyRequest(BaseModel):
+    lots: int = 1
+    entryLogic: str = 'code'    # 'code' | 'avg_signal' | 'fixed'
+    entryAvgPick: str = 'avg'   # 'low' | 'avg' | 'high'  (for avg_signal mode)
+    entryFixed: Optional[float] = None
+    trailingSL: str = 'code'    # 'code' | 'signal' | 'ltp' | 'fixed'
+    slFixed: Optional[float] = None
+
+
 # ── REST Endpoints ──
 
 @app.get("/api/status")
@@ -218,6 +279,7 @@ async def get_status():
     status["telegram"] = telegram.is_running
     status["ws_clients"] = len(ws_manager.active)
     status["lot_size"] = manager.lot_size
+    status["strategy"] = manager.strategy
     return status
 
 
@@ -301,6 +363,16 @@ async def set_lot_size(req: LotSizeRequest):
     return result
 
 
+@app.post("/api/settings/strategy")
+async def set_strategy(req: StrategyRequest):
+    """Save trading strategy settings (entry logic + trailing SL mode)."""
+    manager.strategy = req.dict()
+    # Also update lot size if provided
+    if req.lots and req.lots != manager.lot_size:
+        manager.set_lot_size(req.lots)
+    return {"status": "ok", "strategy": manager.strategy}
+
+
 # ── Kotak Auth Endpoints ──
 
 @app.post("/api/auth/login")
@@ -342,8 +414,8 @@ async def websocket_endpoint(ws: WebSocket):
     """Real-time updates for the frontend dashboard."""
     await ws_manager.connect(ws)
     try:
-        # Send initial state on connect
-        await ws.send_json({
+        # Send initial state
+        await ws_manager.send(ws, {
             "type": "init",
             "data": {
                 "status": manager.get_status(),
@@ -354,14 +426,13 @@ async def websocket_endpoint(ws: WebSocket):
             },
         })
 
-        # Keep connection alive and handle client messages
+        # Keep connection alive and handle client messages (pings etc.)
         while True:
             data = await ws.receive_text()
             try:
                 msg = json.loads(data)
-                # Handle client commands if needed
                 if msg.get("type") == "ping":
-                    await ws.send_json({"type": "pong"})
+                    await ws_manager.send(ws, {"type": "pong"})
             except json.JSONDecodeError:
                 pass
     except WebSocketDisconnect:

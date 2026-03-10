@@ -29,6 +29,7 @@ class MarketFeed:
         self.kotak = kotak_trader
         self._subscriptions: dict[str, dict] = {}   # token -> {symbol, ltp, ...}
         self._tick_callbacks: list[Callable] = []
+        self._raw_tick_callbacks: list[Callable] = []  # sync callbacks, fired directly from SDK thread
         self._running = False
         self._tick_buffer: list[dict] = []
         self._loop = None
@@ -39,10 +40,18 @@ class MarketFeed:
         return self._running
 
     def add_tick_callback(self, callback: Callable):
-        """Register a callback for tick updates.
+        """Register an async callback for tick updates.
         Signature: async callback(token: str, ltp: float, data: dict)
+        Called via run_coroutine_threadsafe from the SDK background thread.
         """
         self._tick_callbacks.append(callback)
+
+    def add_raw_tick_callback(self, callback: Callable):
+        """Register a SYNC callback, called directly from the SDK background thread.
+        Use this for thread-safe operations like queue.put_nowait.
+        Signature: callback(token: str, ltp: float, data: dict)
+        """
+        self._raw_tick_callbacks.append(callback)
 
     # ── Lifecycle ──
 
@@ -228,7 +237,14 @@ class MarketFeed:
         # Inject symbol into tick data for downstream
         tick["symbol"] = self._subscriptions[token].get("symbol", "")
 
-        # Fire callbacks only for valid LTP
+        # Fire sync raw callbacks directly (thread-safe, no event loop needed)
+        for cb in self._raw_tick_callbacks:
+            try:
+                cb(token, ltp, tick)
+            except Exception as e:
+                log.error(f"Raw tick callback error: {e}")
+
+        # Fire async callbacks via run_coroutine_threadsafe
         if ltp > 0:
             for cb in self._tick_callbacks:
                 if self._loop:

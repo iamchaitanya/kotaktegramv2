@@ -32,6 +32,13 @@ class TradeManager:
         self.paper_trader = PaperTrader(self.market_feed)
         self.contract_master = ContractMaster()
         self.lot_size = int(Config.DEFAULT_LOT_SIZE)
+        self.strategy = {
+            'lots': 1,
+            'entryLogic': 'code',   # 'code' | 'avg_signal' | 'fixed'
+            'entryFixed': None,
+            'trailingSL': 'code',   # 'code' | 'signal' | 'ltp' | 'fixed'
+            'slFixed': None,
+        }
 
         self._processed_signals: set[str] = set()  # dedup hashes
         self._ws_broadcast: Optional[callable] = None  # WebSocket broadcaster
@@ -121,6 +128,7 @@ class TradeManager:
         # Check DB for pending orders for this strike (same day)
         pending_trades = [t for t in await db.get_trades(mode=self.mode) if t.get("status") == "pending"]
         order_replaced = False
+        replaced_signal_id = None
         for order in pending_trades:
             order_hash = f"{order.get('strike', signal.strike)}-{order.get('option_type', signal.option_type)}"
             if order_hash == sig_hash or (order.get('trading_symbol') == f"SENSEX{signal.strike}{signal.option_type}"):
@@ -128,8 +136,10 @@ class TradeManager:
                 await db.update_trade(order["id"], {"status": "replaced"})
                 self.paper_trader._pending_orders = [po for po in self.paper_trader._pending_orders if po.get("trade_id") != order["id"]]
                 log.info(f"Cancelled old pending order {order['id']} for {sig_hash}")
+                replaced_signal_id = order.get("signal_id")
                 await self._broadcast("order_update", {
                     "id": order["id"],
+                    "signal_id": replaced_signal_id,  # <─ so frontend can update the OLD signal card
                     "status": "replaced",
                     "status_note": "Replaced by newer signal"
                 })
@@ -151,8 +161,16 @@ class TradeManager:
         # 6. Execute trade
         trade_result = await self._execute_trade(signal_dict, signal_id)
 
+        # Enrich broadcast with signal_id so frontend can update signal cards
+        broadcast_data = {
+            **trade_result,
+            "signal_id": signal_id,                                   # always include
+            "trading_symbol": trade_result.get("trading_symbol") or  # flat access
+                              (trade_result.get("order") or {}).get("trading_symbol", ""),
+        }
+
         # Broadcast trade execution
-        await self._broadcast("new_trade", trade_result)
+        await self._broadcast("new_trade", broadcast_data)
 
         return {"message_id": msg_id, "signal": signal_dict, "trade": trade_result}
 
@@ -186,7 +204,11 @@ class TradeManager:
     async def _execute_paper(self, signal: dict, signal_id: int) -> dict:
         """Execute via paper trading engine."""
         try:
-            result = await self.paper_trader.place_order(signal, signal_id, lot_size=self.lot_size)
+            result = await self.paper_trader.place_order(
+                signal, signal_id,
+                lot_size=self.lot_size,
+                strategy=self.strategy,
+            )
             log.info(f"Paper trade: {result}")
             return result
         except Exception as e:
