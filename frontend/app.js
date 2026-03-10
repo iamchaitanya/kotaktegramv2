@@ -4,8 +4,10 @@
  * Renders real-time trading dashboard
  */
 
-const API_BASE = 'http://localhost:8000';
-const WS_URL = 'ws://localhost:8000/ws';
+const protocol = window.location.protocol;
+const host = window.location.host;
+const API_BASE = `${protocol}//${host}`;
+const WS_URL = `${protocol === 'https:' ? 'wss:' : 'ws:'}//${host}/ws`;
 
 // ── State ──
 const state = {
