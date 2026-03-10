@@ -397,7 +397,6 @@ async def clear_data():
     # Clear in-memory deduplication flags
     manager._processed_signals.clear()
     manager.paper_trader._pending_orders.clear()
-    manager.real_trader._pending_orders.clear()
     return {"status": "ok", "message": "Dashboard data cleared"}
 
 @app.post("/api/test-signal")
