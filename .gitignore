@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# Environment & Secrets
+.env
+*.pem
+*.key
+
+# Telegram Sessions
+*.session
+*.session-journal
+anon.session
+anon.session-journal
+
+# Kotak Neo
+neo_api_client.log
+*.token
+*.access_token
+
+# Database
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Node
+node_modules/
+package-lock.json
+
+# OS
+.DS_Store
+Thumbs.db
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.code-workspace

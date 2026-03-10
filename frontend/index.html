@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Kotak Trader — Live Dashboard</title>
+    <meta name="description"
+        content="Real-time Sensex options trading dashboard — Telegram signals to Kotak Neo execution">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="style.css?v=4">
+</head>
+
+<body>
+    <!-- ── Header ── -->
+    <header id="app-header">
+        <div class="header-left">
+            <div class="logo">
+                <span class="logo-icon">⚡</span>
+                <h1>TradeBridge</h1>
+            </div>
+            <div class="connection-badges">
+                <span id="badge-telegram" class="badge badge-disconnected">
+                    <span class="badge-dot"></span> Telegram
+                </span>
+                <span id="badge-kotak" class="badge badge-disconnected">
+                    <span class="badge-dot"></span> Kotak Neo
+                </span>
+                <span id="badge-ws" class="badge badge-disconnected">
+                    <span class="badge-dot"></span> Server
+                </span>
+            </div>
+        </div>
+        <div class="header-right">
+            <button class="hamburger-btn" id="btn-hamburger" aria-label="Menu">
+                <span></span><span></span><span></span>
+            </button>
+            <div class="header-menu" id="header-menu">
+                <div class="mode-toggle" id="mode-toggle">
+                    <button class="mode-btn active" data-mode="paper" id="btn-paper">
+                        📄 Paper
+                    </button>
+                    <button class="mode-btn" data-mode="real" id="btn-real">
+                        🔴 Real
+                    </button>
+                </div>
+                <div class="lot-control">
+                    <label for="lot-input">Lots:</label>
+                    <input type="number" id="lot-input" min="1" max="100" value="1" class="lot-input">
+                    <button class="btn btn-sm btn-secondary" id="btn-set-lots">Set</button>
+                </div>
+                <button class="btn btn-kill" id="btn-kill" title="Square off ALL positions">🛑 Kill All</button>
+                <button class="icon-btn" id="btn-clear" title="Clear Dashboard Data" style="color: #ef4444;">🗑️</button>
+                <button class="icon-btn" id="btn-refresh" title="Hard Refresh" onclick="location.reload(true)">🔄</button>
+                <button class="icon-btn" id="btn-settings" title="Settings">⚙️</button>
+            </div>
+        </div>
+    </header>
+
+    <!-- ── Main Dashboard Grid ── -->
+    <main id="dashboard">
+        <!-- Left: Telegram Messages -->
+        <section class="panel panel-messages" id="panel-messages">
+            <div class="panel-header">
+                <h2>📨 Telegram Messages</h2>
+                <span class="panel-count" id="msg-count">0</span>
+            </div>
+            <div class="panel-body" id="messages-list">
+                <div class="empty-state">Waiting for messages...</div>
+            </div>
+        </section>
+
+        <!-- Center: Parsed Signals -->
+        <section class="panel panel-signals" id="panel-signals">
+            <div class="panel-header">
+                <h2>🎯 Parsed Signals</h2>
+                <span class="panel-count" id="signal-count">0</span>
+            </div>
+            <div class="panel-body" id="signals-list">
+                <div class="empty-state">No signals parsed yet</div>
+            </div>
+        </section>
+
+        <!-- Right: Positions & P&L -->
+        <section class="panel panel-positions" id="panel-positions">
+            <div class="panel-header">
+                <h2>📊 Positions</h2>
+                <span class="panel-count" id="pos-count">0</span>
+            </div>
+            <div class="pnl-banner" id="pnl-banner">
+                <div class="pnl-label">Unrealized P&L</div>
+                <div class="pnl-value" id="pnl-value">₹0.00</div>
+            </div>
+            <div class="panel-body" id="positions-list">
+                <div class="empty-state">No open positions</div>
+            </div>
+        </section>
+
+        <!-- Bottom: Trade Log -->
+        <section class="panel panel-trades" id="panel-trades">
+            <div class="panel-header">
+                <h2>📋 Trade Log</h2>
+                <div class="trade-filters">
+                    <button class="filter-btn active" data-filter="all">All</button>
+                    <button class="filter-btn" data-filter="filled">Filled</button>
+                    <button class="filter-btn" data-filter="pending">Pending</button>
+                    <button class="filter-btn" data-filter="failed">Failed</button>
+                </div>
+                <span class="panel-count" id="trade-count">0</span>
+            </div>
+            <div class="panel-body scrollable-x" id="trades-list">
+                <div class="empty-state">No trades yet</div>
+            </div>
+        </section>
+    </main>
+
+    <!-- ── Settings Modal ── -->
+    <div class="modal-overlay" id="settings-modal" style="display:none;">
+        <div class="modal">
+            <div class="modal-header">
+                <h2>⚙️ Settings</h2>
+                <button class="modal-close" id="btn-close-settings">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="settings-section">
+                    <h3>Kotak Neo Authentication</h3>
+                    <div class="settings-status" id="kotak-auth-status">Not connected</div>
+                    <button class="btn btn-primary" id="btn-kotak-login">Login to Kotak Neo</button>
+                    <div class="otp-row" id="otp-row" style="display:none;">
+                        <input type="text" id="otp-input" placeholder="Enter OTP" maxlength="6" class="input">
+                        <button class="btn btn-primary" id="btn-submit-otp">Submit OTP</button>
+                    </div>
+                </div>
+                <div class="settings-section">
+                    <h3>Test Signal</h3>
+                    <textarea id="test-signal-input" class="input textarea" rows="4"
+                        placeholder="Trading Floor&#10;Sensex 82500 CE&#10;Price @150-160"></textarea>
+                    <button class="btn btn-secondary" id="btn-send-test">Send Test Signal</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Confirm Real Mode Modal ── -->
+    <div class="modal-overlay" id="confirm-real-modal" style="display:none;">
+        <div class="modal modal-sm">
+            <div class="modal-header modal-header-danger">
+                <h2>⚠️ Switch to Real Trading?</h2>
+            </div>
+            <div class="modal-body">
+                <p>This will place <strong>actual orders</strong> on Kotak Neo with <strong>real money</strong>.</p>
+                <p>Make sure Kotak Neo is authenticated and you understand the risks.</p>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" id="btn-cancel-real">Cancel</button>
+                    <button class="btn btn-danger" id="btn-confirm-real">Yes, Switch to Real</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Toast Container ── -->
+    <div id="toast-container"></div>
+
+    <script src="app.js?v=4"></script>
+</body>
+
+</html>
