@@ -46,6 +46,12 @@ document.addEventListener('DOMContentLoaded', () => {
     // Update only timer text every second — no full DOM rebuild = no flicker
     setInterval(() => {
         document.querySelectorAll('[data-timer-start]').forEach(el => {
+            const tradeStatus = el.getAttribute('data-trade-status') || '';
+            // Stop ticking if the trade is in a terminal state
+            if (['filled', 'closed', 'replaced', 'expired'].includes(tradeStatus)) {
+                return; 
+            }
+
             const start = el.getAttribute('data-timer-start');
             const mins = parseInt(el.getAttribute('data-timer-mins') || '10');
             const label = el.getAttribute('data-timer-label') || 'Timer';
@@ -254,14 +260,16 @@ function handleWSMessage(msg) {
 
             case 'new_signal':
                 console.log("Adding new signal:", msg.data);
-                // Deduplicate: replace existing signal for same strike+option_type
+                // Deduplicate: mark existing signal for same strike+option_type as replaced
                 if (msg.data.strike && msg.data.option_type) {
                     const existingIdx = state.signals.findIndex(s =>
                         String(s.strike) === String(msg.data.strike) && 
-                        String(s.option_type).toUpperCase() === String(msg.data.option_type).toUpperCase()
+                        String(s.option_type).toUpperCase() === String(msg.data.option_type).toUpperCase() &&
+                        !['filled', 'closed', 'expired', 'replaced'].includes(s.trade_status)
                     );
                     if (existingIdx !== -1) {
-                        state.signals.splice(existingIdx, 1);
+                        state.signals[existingIdx].trade_status = 'replaced';
+                        state.signals[existingIdx].status_note = 'Replaced by newer signal';
                     }
                 }
                 state.signals.unshift(msg.data);
@@ -654,13 +662,12 @@ function renderSignals() {
                         <span class="signal-status ${s.status}">${s.status}</span>
                         <div style="display: flex; gap: 6px; align-items: center;">
                             ${isValid && timerStart && !['filled', 'closed', 'replaced', 'expired'].includes(tradeStatus) 
-                                ? `<span class="timer-tag" data-timer-start="${timerStart}" data-timer-mins="10" data-timer-label="Entry">⏳ Entry: --:--</span>` 
+                                ? `<span class="timer-tag" data-timer-start="${timerStart}" data-timer-mins="10" data-timer-label="Entry" data-trade-status="${tradeStatus}">⏳ Entry: --:--</span>` 
                                 : ''}
                             ${tradeStatus && tradeStatus !== 'valid' ? `<span class="signal-status ${tradeStatus}">${tradeStatus}</span>` : ''}
                         </div>
                     </div>
-                    ${s.status_note ? `<div class="signal-note">ℹ️ ${esc(s.status_note)}</div>` : ''}
-                    ${s.reason ? `<div class="signal-reason">${esc(s.reason)}</div>` : ''}
+                    ${isValid && s.reason ? `<div class="signal-reason">${esc(s.reason)}</div>` : ''}
                     ${isValid ? `
                         <div class="signal-details">
                             <div><span class="label">Index</span><br><span class="value">${esc(s.idx || s.index || '')}</span></div>
@@ -744,7 +751,6 @@ function renderPositions() {
                     <div class="pos-strategy">
                         <span class="sl-tag">SL: ₹${(p.trailing_sl || 0).toFixed(2)}</span>
                         ${p.max_ltp ? `<span class="max-tag">Max: ₹${p.max_ltp.toFixed(2)}</span>` : ''}
-                        ${p.status_note ? `<span class="note-tag">${esc(p.status_note)}</span>` : ''}
                     </div>
                 </div>
                 <div class="pos-pnl ${pnlClass}">${pnl >= 0 ? '+' : ''}₹${pnl.toFixed(2)}</div>

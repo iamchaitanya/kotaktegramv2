@@ -4,6 +4,7 @@ Main FastAPI application — REST API + WebSocket for the trading platform.
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta, time as dt_time
 from typing import Optional
@@ -11,6 +12,8 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .config import Config
@@ -242,6 +245,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Frontend — serve static files ──
+FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
+
+@app.get("/", include_in_schema=False)
+async def serve_index():
+    """Serve the frontend dashboard."""
+    return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+
 
 # ── Pydantic Models ──
 class ModeRequest(BaseModel):
@@ -443,3 +454,8 @@ async def websocket_endpoint(ws: WebSocket):
     except Exception as e:
         log.error(f"WS error: {e}")
         ws_manager.disconnect(ws)
+
+
+# ── Mount frontend static assets (CSS, JS, images) ──
+# Must be after all API routes so it doesn't shadow /api/* or /ws
+app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

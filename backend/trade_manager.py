@@ -125,13 +125,17 @@ class TradeManager:
                 log.info(f"Signal skipped — position already open for {sig_hash}")
                 return {"message_id": msg_id, "signal": signal_dict, "trade": None, "skipped": "position_open"}
 
-        # Check DB for pending orders for this strike (same day)
         pending_trades = [t for t in await db.get_trades(mode=self.mode) if t.get("status") == "pending"]
         order_replaced = False
         replaced_signal_id = None
+        
+        sig_suffix = f"{signal.strike}{signal.option_type}".upper()
+        
         for order in pending_trades:
-            order_hash = f"{order.get('strike', signal.strike)}-{order.get('option_type', signal.option_type)}"
-            if order_hash == sig_hash or (order.get('trading_symbol') == f"SENSEX{signal.strike}{signal.option_type}"):
+            order_sym = order.get('trading_symbol', '').upper()
+            
+            # Match if trading symbol ends with strike+option_type (handles both SENSEX78500CE and SENSEX2631278500CE)
+            if order_sym.endswith(sig_suffix):
                 # Cancel the old pending order in DB and memory
                 await db.update_trade(order["id"], {"status": "replaced"})
                 self.paper_trader._pending_orders = [po for po in self.paper_trader._pending_orders if po.get("trade_id") != order["id"]]
@@ -194,6 +198,7 @@ class TradeManager:
                 log.info(f"Cancelled old pending order {order['trade_id']} for {order['trading_symbol']}")
                 await self._broadcast("order_update", {
                     "id": order["trade_id"],
+                    "signal_id": order.get("signal_id"),
                     "status": "replaced",
                     "status_note": "Replaced by newer signal"
                 })
