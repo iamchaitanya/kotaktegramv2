@@ -5,7 +5,7 @@ Handles mode switching, duplicate detection, and market hours validation.
 import asyncio
 import logging
 from datetime import datetime, time, timezone
-from typing import Optional
+from typing import Optional, Callable, Any, Dict
 
 from .config import Config
 from .signal_parser import parse_signal
@@ -32,7 +32,7 @@ class TradeManager:
         self.paper_trader = PaperTrader(self.market_feed)
         self.contract_master = ContractMaster()
         self.lot_size = int(Config.DEFAULT_LOT_SIZE)
-        self.strategy = {
+        self.strategy: Dict[str, Any] = {
             'lots': 1,
             'entryLogic': 'code',   # 'code' | 'avg_signal' | 'fixed'
             'entryFixed': None,
@@ -41,7 +41,7 @@ class TradeManager:
         }
 
         self._processed_signals: set[str] = set()  # dedup hashes
-        self._ws_broadcast: Optional[callable] = None  # WebSocket broadcaster
+        self._ws_broadcast: Optional[Callable] = None  # WebSocket broadcaster
 
     def set_lot_size(self, lots: int):
         """Update the number of lots for upcoming trades."""
@@ -56,9 +56,10 @@ class TradeManager:
 
     async def _broadcast(self, event_type: str, data: dict):
         """Broadcast event to all WebSocket clients."""
-        if self._ws_broadcast:
+        ws_broadcast = self._ws_broadcast
+        if ws_broadcast:
             try:
-                await self._ws_broadcast({"type": event_type, "data": data})
+                await ws_broadcast({"type": event_type, "data": data})
             except Exception as e:
                 log.error(f"Broadcast error: {e}")
 
@@ -163,14 +164,16 @@ class TradeManager:
             return {"message_id": msg_id, "signal": signal_dict, "trade": None, "skipped": "market_closed"}
 
         # 6. Execute trade
-        trade_result = await self._execute_trade(signal_dict, signal_id)
+        trade_result: Dict[str, Any] = await self._execute_trade(signal_dict, signal_id)
 
         # Enrich broadcast with signal_id so frontend can update signal cards
+        order_dict = trade_result.get("order")
+        order_sym = order_dict.get("trading_symbol", "") if isinstance(order_dict, dict) else ""
+        
         broadcast_data = {
             **trade_result,
             "signal_id": signal_id,                                   # always include
-            "trading_symbol": trade_result.get("trading_symbol") or  # flat access
-                              (trade_result.get("order") or {}).get("trading_symbol", ""),
+            "trading_symbol": trade_result.get("trading_symbol") or order_sym,
         }
 
         # Broadcast trade execution
@@ -282,7 +285,7 @@ class TradeManager:
             return
 
         recent_signals = await db.get_signals(limit=limit)
-        count = 0
+        subs_count = 0
         for sig in recent_signals:
             if sig.get('status') == 'valid' and sig.get('strike') and sig.get('option_type'):
                 lookup = self.contract_master.lookup(str(sig['strike']), sig['option_type'])
@@ -292,9 +295,9 @@ class TradeManager:
                     # Avoid duplicate subscription calls if already tracked
                     if str(token) not in self.market_feed._subscriptions:
                         self.market_feed.subscribe_instrument(token, symbol)
-                        count += 1
-        if count > 0:
-            log.info(f"Re-subscribed to {count} recent signals from database")
+                        subs_count = int(subs_count) + 1
+        if int(subs_count) > 0:
+            log.info(f"Re-subscribed to {subs_count} recent signals from database")
 
     # ── Mode Management ──
 
@@ -318,7 +321,7 @@ class TradeManager:
         """Login to Kotak Neo."""
         return self.kotak.login()
 
-    async def complete_2fa(self, otp: str = None) -> dict:
+    async def complete_2fa(self, otp: Optional[str] = None) -> dict:
         """Complete Kotak Neo 2FA."""
         result = self.kotak.complete_2fa(otp)
         if result.get("status") == "ok":
