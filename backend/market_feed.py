@@ -2,9 +2,18 @@
 Market Feed — Subscribes to Kotak Neo websocket for real-time tick data.
 Provides live LTP to paper and real trading engines.
 Stores every tick for backtesting.
+
+PATCHES APPLIED:
+ [1] Singleton _loop captured via get_running_loop() at start() time
+ [2] _flush_tick_buffer uses stored _loop instead of deprecated get_event_loop()
+ [3] _on_close triggers automatic reconnect via background thread
+ [4] stop() method for clean shutdown / pre-refresh teardown
+ [5] Reconnect has exponential backoff with max 60s cap
 """
 import asyncio
 import logging
+import threading
+import time
 from typing import Callable
 from datetime import datetime, timezone
 
@@ -13,27 +22,30 @@ from . import database as db
 log = logging.getLogger(__name__)
 
 TICK_BUFFER_SIZE = 50  # Flush to DB every N ticks
+RECONNECT_BASE_DELAY = 5    # Initial reconnect wait (seconds)
+RECONNECT_MAX_DELAY = 60    # Maximum reconnect wait (seconds)
 
 
 class MarketFeed:
     """Manages Kotak Neo websocket subscriptions for live market data.
 
     Design principle: The Kotak Neo SDK (neo_api_client) internally manages
-    its own WebSocket thread lifecycle. We do NOT attempt to reconnect,
-    re-create sockets, or call subscribe() from within callbacks.
-    We only: (1) set up callbacks once, (2) subscribe to instruments,
-    (3) process ticks when they arrive.
+    its own WebSocket thread lifecycle. We set up callbacks once, subscribe
+    to instruments, and process ticks when they arrive. On disconnect,
+    we attempt automatic reconnection with exponential backoff.
     """
 
     def __init__(self, kotak_trader=None):
         self.kotak = kotak_trader
         self._subscriptions: dict[str, dict] = {}   # token -> {symbol, ltp, ...}
         self._tick_callbacks: list[Callable] = []
-        self._raw_tick_callbacks: list[Callable] = []  # sync callbacks, fired directly from SDK thread
+        self._raw_tick_callbacks: list[Callable] = []
         self._running = False
         self._tick_buffer: list[dict] = []
-        self._loop = None
-        self._pending_subs: list[dict] = []  # Queued until WS is open
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._pending_subs: list[dict] = []
+        self._reconnect_attempts = 0
+        self._should_reconnect = True  # Set to False during intentional stop()
 
     @property
     def is_running(self) -> bool:
@@ -42,13 +54,11 @@ class MarketFeed:
     def add_tick_callback(self, callback: Callable):
         """Register an async callback for tick updates.
         Signature: async callback(token: str, ltp: float, data: dict)
-        Called via run_coroutine_threadsafe from the SDK background thread.
         """
         self._tick_callbacks.append(callback)
 
     def add_raw_tick_callback(self, callback: Callable):
         """Register a SYNC callback, called directly from the SDK background thread.
-        Use this for thread-safe operations like queue.put_nowait.
         Signature: callback(token: str, ltp: float, data: dict)
         """
         self._raw_tick_callbacks.append(callback)
@@ -57,10 +67,14 @@ class MarketFeed:
 
     def start(self):
         """Set up websocket callbacks with Kotak Neo. Call once after login."""
+        # [1] Capture the running loop reliably — used for threadsafe scheduling
         try:
-            self._loop = asyncio.get_event_loop()
+            self._loop = asyncio.get_running_loop()
         except RuntimeError:
-            pass
+            try:
+                self._loop = asyncio.get_event_loop()
+            except RuntimeError:
+                pass
 
         if not self.kotak or not self.kotak.is_authenticated:
             log.warning("Cannot start market feed — Kotak not authenticated")
@@ -74,11 +88,20 @@ class MarketFeed:
                 on_open=self._on_open,
             )
             self._running = True
+            self._should_reconnect = True
+            self._reconnect_attempts = 0
             log.info("Market feed: callbacks registered")
             return True
         except Exception as e:
             log.error(f"Failed to start market feed: {e}")
             return False
+
+    def stop(self):
+        """[4] Intentionally stop the market feed (no reconnect)."""
+        self._should_reconnect = False
+        self._running = False
+        self._reconnect_attempts = 0
+        log.info("Market feed stopped intentionally")
 
     # ── Subscription ──
 
@@ -86,7 +109,6 @@ class MarketFeed:
         """Subscribe to a specific instrument for live data."""
         token_str = str(token)
 
-        # Track locally even if already subscribed (idempotent)
         if token_str not in self._subscriptions:
             self._subscriptions[token_str] = {
                 "symbol": symbol,
@@ -112,13 +134,10 @@ class MarketFeed:
         self.subscribe_instrument(token, symbol, exchange_segment="bse_cm")
 
     def subscribe_batch(self, tokens: list[dict]):
-        """Subscribe to multiple instruments in a single SDK call.
-        Each item: {"instrument_token": str, "exchange_segment": str, "symbol": str}
-        """
+        """Subscribe to multiple instruments in a single SDK call."""
         if not self.kotak or not self.kotak.is_authenticated:
             return
 
-        # Track locally
         for item in tokens:
             tk = str(item["instrument_token"])
             self._subscriptions[tk] = {
@@ -128,7 +147,6 @@ class MarketFeed:
                 "exchange_segment": item["exchange_segment"],
             }
 
-        # Single SDK call for items where WS is open
         sub_list = [{"instrument_token": str(t["instrument_token"]), "exchange_segment": t["exchange_segment"]} for t in tokens]
         if self._running:
             try:
@@ -151,6 +169,20 @@ class MarketFeed:
                     self.kotak.unsubscribe([{"instrument_token": token_str, "exchange_segment": seg}])
                 except Exception as e:
                     log.error(f"Unsubscribe failed: {e}")
+
+    def _resubscribe_all(self):
+        """Re-subscribe to all tracked instruments after reconnect."""
+        if not self.kotak or not self._subscriptions:
+            return
+        sub_list = [
+            {"instrument_token": tk, "exchange_segment": info.get("exchange_segment", "bse_fo")}
+            for tk, info in self._subscriptions.items()
+        ]
+        try:
+            self.kotak.subscribe(instrument_tokens=sub_list)
+            log.info(f"Re-subscribed to {len(sub_list)} instruments after reconnect")
+        except Exception as e:
+            log.error(f"Re-subscribe after reconnect failed: {e}")
 
     # ── Data Access ──
 
@@ -183,12 +215,66 @@ class MarketFeed:
         log.error(f"Market feed WS error: {error}")
 
     def _on_close(self, message):
+        """[3] When WS closes, attempt automatic reconnect in a background thread."""
         log.warning(f"Market feed WS closed: {message}")
         self._running = False
+
+        if not self._should_reconnect:
+            log.info("Reconnect disabled — not attempting reconnect")
+            return
+
+        # Spawn a background thread to avoid blocking the SDK's thread
+        thread = threading.Thread(target=self._reconnect_loop, daemon=True)
+        thread.start()
+
+    def _reconnect_loop(self):
+        """[3][5] Background thread: re-login + restart + re-subscribe with exponential backoff."""
+        while self._should_reconnect and not self._running:
+            self._reconnect_attempts += 1
+            # Exponential backoff: 5s, 10s, 20s, 40s, capped at 60s
+            delay = min(
+                RECONNECT_BASE_DELAY * (2 ** (self._reconnect_attempts - 1)),
+                RECONNECT_MAX_DELAY,
+            )
+            log.info(
+                f"Market feed reconnect attempt #{self._reconnect_attempts} "
+                f"in {delay}s..."
+            )
+            time.sleep(delay)
+
+            if not self._should_reconnect:
+                break
+
+            try:
+                # Re-authenticate (Kotak sessions may expire on WS drop)
+                if self.kotak:
+                    login_result = self.kotak.login()
+                    if isinstance(login_result, dict) and login_result.get("status") == "ok":
+                        log.info("Kotak re-login successful for reconnect")
+                    else:
+                        log.warning(f"Kotak re-login failed: {login_result}")
+                        continue
+
+                # Re-register callbacks and restart
+                if self.start():
+                    log.info("✅ Market feed reconnected successfully!")
+                    # Re-subscribe happens in _on_open when the WS actually opens
+                    # But also queue all known subscriptions
+                    self._pending_subs = [
+                        {"instrument_token": tk, "exchange_segment": info.get("exchange_segment", "bse_fo")}
+                        for tk, info in self._subscriptions.items()
+                    ]
+                    self._reconnect_attempts = 0
+                    break
+                else:
+                    log.warning("Market feed start() failed — will retry")
+            except Exception as e:
+                log.error(f"Reconnect attempt #{self._reconnect_attempts} failed: {e}")
 
     def _on_open(self, message):
         log.info(f"Market feed WS opened: {message}")
         self._running = True
+        self._reconnect_attempts = 0
         # Flush any subscriptions that were queued before WS was open
         if self._pending_subs and self.kotak:
             log.info(f"Flushing {len(self._pending_subs)} queued subscriptions...")
@@ -214,7 +300,6 @@ class MarketFeed:
         if not token or token not in self._subscriptions:
             return
 
-        # Update local state (skip zero-LTP ticks)
         if ltp > 0:
             self._subscriptions[token]["ltp"] = ltp
         self._subscriptions[token]["last_update"] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
@@ -238,31 +323,25 @@ class MarketFeed:
         tick["symbol"] = self._subscriptions[token].get("symbol", "")
 
         # Fire sync raw callbacks directly (thread-safe, no event loop needed)
-        for cb in self._raw_tick_callbacks:
-            try:
-                cb(token, ltp, tick)
-            except Exception as e:
-                log.error(f"Raw tick callback error: {e}")
+        if ltp > 0:
+            for cb in self._raw_tick_callbacks:
+                try:
+                    cb(token, ltp, tick)
+                except Exception as e:
+                    log.error(f"Raw tick callback error: {e}")
 
-        # Fire async callbacks via run_coroutine_threadsafe
+        # [1] Fire async callbacks via run_coroutine_threadsafe using stored _loop
         if ltp > 0:
             for cb in self._tick_callbacks:
-                if self._loop:
+                if self._loop and not self._loop.is_closed():
                     asyncio.run_coroutine_threadsafe(cb(token, ltp, tick), self._loop)
-                else:
-                    try:
-                        asyncio.get_event_loop().create_task(cb(token, ltp, tick))
-                    except RuntimeError:
-                        pass
 
     def _flush_tick_buffer(self):
-        """Flush buffered ticks to database."""
+        """[2] Flush buffered ticks to database using stored _loop."""
         if not self._tick_buffer:
             return
         ticks_to_save = list(self._tick_buffer)
         self._tick_buffer.clear()
-        try:
-            loop = asyncio.get_event_loop()
-            loop.create_task(db.save_ticks_batch(ticks_to_save))
-        except RuntimeError:
-            pass
+        if self._loop and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(db.save_ticks_batch(ticks_to_save), self._loop)
+

@@ -2,6 +2,19 @@
  * TradeBridge — Frontend Application
  * Connects to FastAPI backend via REST + WebSocket
  * Renders real-time trading dashboard
+ *
+ * PATCHES APPLIED:
+ *  [1] Strategy now syncs from server on init; localStorage used only as fallback
+ *  [2] renderMessages() ordering fixed — fragment built in correct order
+ *  [3] renderPositions() upserts instead of full innerHTML rebuild (fixes timer flicker)
+ *  [4] Timer flicker eliminated by [3]
+ *  [5] exitPosition() no longer optimistically removes — waits for position_update WS event
+ *  [6] esc() reuses a single cached DOM element instead of creating one per call
+ *  [7] pingInterval cleared correctly on reconnect via ws._pingInterval
+ *  [8] state.signals sorted by created_at before rendering
+ *  [9] Duplicate position insertion guarded correctly using position_id
+ * [10] renderTrades() debounced at 100ms
+ * [11] Modal overlay close uses event delegation on document instead of per-modal binding
  */
 
 const protocol = window.location.protocol;
@@ -21,10 +34,10 @@ const state = {
     sensex_ltp: 0,
     strategy: {
         lots: 1,
-        entryLogic: 'code',  // 'code' | 'avg_signal' | 'fixed'
-        entryAvgPick: 'avg', // 'low' | 'avg' | 'high'  — sub-option for avg_signal
+        entryLogic: 'code',
+        entryAvgPick: 'avg',
         entryFixed: null,
-        trailingSL: 'code',  // 'code' | 'signal' | 'ltp' | 'fixed'
+        trailingSL: 'code',
         slFixed: null,
     },
 };
@@ -36,6 +49,23 @@ let reconnectTimer = null;
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
+// ── [6] Cached escape element — avoids creating a new DOM node on every call ──
+const _escDiv = document.createElement('div');
+function esc(str) {
+    _escDiv.textContent = str || '';
+    return _escDiv.innerHTML;
+}
+
+// ── [10] Debounce helper ──
+function debounce(fn, ms) {
+    let timer;
+    return (...args) => {
+        clearTimeout(timer);
+        timer = setTimeout(() => fn(...args), ms);
+    };
+}
+const renderTradesDebounced = debounce(renderTrades, 100);
+
 // ── Init ──
 document.addEventListener('DOMContentLoaded', () => {
     loadStrategy();
@@ -43,21 +73,16 @@ document.addEventListener('DOMContentLoaded', () => {
     connectWebSocket();
     fetchInitialData();
 
-    // Update only timer text every second — no full DOM rebuild = no flicker
     setInterval(() => {
         document.querySelectorAll('[data-timer-start]').forEach(el => {
             const tradeStatus = el.getAttribute('data-trade-status') || '';
-            // Stop ticking if the trade is in a terminal state
-            if (['filled', 'closed', 'replaced', 'expired'].includes(tradeStatus)) {
-                return; 
-            }
+            if (['filled', 'closed', 'replaced', 'expired'].includes(tradeStatus)) return;
 
             const start = el.getAttribute('data-timer-start');
             const mins = parseInt(el.getAttribute('data-timer-mins') || '10');
             const label = el.getAttribute('data-timer-label') || 'Timer';
             const countdown = getCountdown(start, mins);
             if (countdown === null) {
-                // Timer expired — update timer tag independently
                 el.textContent = `❌ EXPIRED`;
                 el.classList.add('expired');
             } else {
@@ -69,14 +94,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // ── Event Binding ──
 function bindEvents() {
-    // Hamburger menu toggle (mobile)
     const hamburger = $('#btn-hamburger');
     const headerMenu = $('#header-menu');
     hamburger.addEventListener('click', () => {
         headerMenu.classList.toggle('open');
         hamburger.classList.toggle('open');
     });
-    // Close menu on tap outside
     document.addEventListener('click', (e) => {
         if (!e.target.closest('.header-right') && headerMenu.classList.contains('open')) {
             headerMenu.classList.remove('open');
@@ -84,14 +107,10 @@ function bindEvents() {
         }
     });
 
-    // Mode toggle
     $('#btn-paper').addEventListener('click', () => setMode('paper'));
     $('#btn-real').addEventListener('click', () => {
-        // Show confirmation for real mode
         $('#confirm-real-modal').style.display = 'flex';
     });
-
-    // Confirm real mode
     $('#btn-confirm-real').addEventListener('click', () => {
         $('#confirm-real-modal').style.display = 'none';
         setMode('real');
@@ -100,7 +119,6 @@ function bindEvents() {
         $('#confirm-real-modal').style.display = 'none';
     });
 
-    // Settings
     $('#btn-settings').addEventListener('click', () => {
         $('#settings-modal').style.display = 'flex';
     });
@@ -108,18 +126,15 @@ function bindEvents() {
         $('#settings-modal').style.display = 'none';
     });
 
-    // Panel collapse toggle (mobile only)
     $$('.panel-header').forEach(header => {
-        header.addEventListener('click', (e) => {
+        header.addEventListener('click', () => {
             if (window.innerWidth <= 768) {
                 const panel = header.closest('.panel');
                 panel.classList.toggle('collapsed');
-                console.log('Panel toggled:', panel.id);
             }
         });
     });
 
-    // Clear Dashboard Data
     $('#btn-clear').addEventListener('click', async () => {
         if (confirm("Are you sure you want to completely clear the dashboard?\n\nThis will delete all messages, signals, trades, and positions.\n\nNote: Backtesting ticks will NOT be deleted.")) {
             try {
@@ -136,7 +151,6 @@ function bindEvents() {
         }
     });
 
-    // Kill switch
     $('#btn-kill').addEventListener('click', async () => {
         if (confirm('\u26a0\ufe0f KILL SWITCH\n\nThis will:\n\u2022 Close ALL open positions at current price\n\u2022 Cancel ALL pending orders\n\nAre you sure?')) {
             try {
@@ -149,20 +163,16 @@ function bindEvents() {
         }
     });
 
-    // Lot size control
     $('#btn-set-lots').addEventListener('click', setLotSize);
     $('#lot-input').addEventListener('keydown', (e) => {
         if (e.key === 'Enter') setLotSize();
     });
 
-    // Kotak login
     $('#btn-kotak-login').addEventListener('click', kotakLogin);
     $('#btn-submit-otp').addEventListener('click', submitOTP);
 
-    // Test signal
     $('#btn-send-test').addEventListener('click', sendTestSignal);
 
-    // Trade filters
     $$('.filter-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             $$('.filter-btn').forEach(b => b.classList.remove('active'));
@@ -172,14 +182,13 @@ function bindEvents() {
         });
     });
 
-    // Close modals on overlay click
-    $$('.modal-overlay').forEach(overlay => {
-        overlay.addEventListener('click', (e) => {
-            if (e.target === overlay) overlay.style.display = 'none';
-        });
+    // [11] Single delegated modal-overlay close handler on document
+    document.addEventListener('click', (e) => {
+        if (e.target.classList.contains('modal-overlay')) {
+            e.target.style.display = 'none';
+        }
     });
 
-    // Strategy modal
     bindStrategyModal();
 }
 
@@ -188,6 +197,13 @@ function connectWebSocket() {
     if (ws && ws.readyState === WebSocket.OPEN) return;
 
     ws = new WebSocket(WS_URL);
+
+    // [7] Attach pingInterval to the ws instance so onclose can clear the right one
+    ws._pingInterval = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping' }));
+        }
+    }, 20000);
 
     ws.onopen = () => {
         state.wsConnected = true;
@@ -208,18 +224,11 @@ function connectWebSocket() {
         }
     };
 
-    // Heartbeat to prevent silent connection drops
-    const pingInterval = setInterval(() => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'ping' }));
-        }
-    }, 20000); // 20 seconds
-
     ws.onclose = () => {
         state.wsConnected = false;
-        clearInterval(pingInterval);
+        // [7] Clear this connection's ping interval specifically
+        clearInterval(ws._pingInterval);
         updateBadge('badge-ws', false);
-        // Auto-reconnect
         if (!reconnectTimer) {
             reconnectTimer = setInterval(() => {
                 console.log('Reconnecting WebSocket...');
@@ -237,19 +246,22 @@ function handleWSMessage(msg) {
     try {
         if (!msg) return;
 
-        // Log non-tick messages
         if (msg.type !== 'instrument_ltp' && msg.type !== 'index_ltp') {
             console.log("WS Received:", msg.type, msg.data);
         }
 
         switch (msg.type) {
             case 'init':
-                // Full state sync on connect
                 state.messages = msg.data.messages || [];
                 state.signals = msg.data.signals || [];
                 state.trades = msg.data.trades || [];
                 state.positions = msg.data.positions || [];
                 updateStatusFromData(msg.data.status);
+                // [1] Prefer server-provided strategy over localStorage
+                if (msg.data.strategy) {
+                    state.strategy = { ...STRATEGY_DEFAULTS, ...msg.data.strategy };
+                    persistStrategy();
+                }
                 renderAll();
                 break;
 
@@ -260,10 +272,9 @@ function handleWSMessage(msg) {
 
             case 'new_signal':
                 console.log("Adding new signal:", msg.data);
-                // Deduplicate: mark existing signal for same strike+option_type as replaced
                 if (msg.data.strike && msg.data.option_type) {
                     const existingIdx = state.signals.findIndex(s =>
-                        String(s.strike) === String(msg.data.strike) && 
+                        String(s.strike) === String(msg.data.strike) &&
                         String(s.option_type).toUpperCase() === String(msg.data.option_type).toUpperCase() &&
                         !['filled', 'closed', 'expired', 'replaced'].includes(s.trade_status)
                     );
@@ -281,7 +292,6 @@ function handleWSMessage(msg) {
 
             case 'new_trade':
                 if (msg.data) {
-                    // Upsert: update existing entry if same trade_id, else prepend
                     const newTradeId = msg.data.trade_id || msg.data.id;
                     const existingIdx = state.trades.findIndex(t => (t.trade_id || t.id) === newTradeId);
                     if (existingIdx !== -1) {
@@ -290,13 +300,13 @@ function handleWSMessage(msg) {
                         state.trades.unshift(msg.data);
                     }
 
-                    // If this trade is a fill, add it to positions
                     if (msg.data.status === 'filled') {
-                        const posId = msg.data.position_id || msg.data.id;
-                        if (!state.positions.some(p => p.id === posId)) {
+                        // [9] Use position_id exclusively to guard against duplicates
+                        const posId = msg.data.position_id;
+                        if (posId && !state.positions.some(p => p.position_id === posId || p.id === posId)) {
                             state.positions.unshift(msg.data);
+                            renderPositions();
                         }
-                        // Update matching signal card
                         if (msg.data.signal_id) {
                             const sigIdx = state.signals.findIndex(s => s.id === msg.data.signal_id);
                             if (sigIdx !== -1) {
@@ -306,7 +316,6 @@ function handleWSMessage(msg) {
                             }
                         }
                     } else if (msg.data.status === 'pending' && msg.data.signal_id) {
-                        // New pending order — update signal card to show pending
                         const sigIdx = state.signals.findIndex(s => s.id === msg.data.signal_id);
                         if (sigIdx !== -1) {
                             state.signals[sigIdx].trade_status = 'pending';
@@ -314,8 +323,8 @@ function handleWSMessage(msg) {
                         }
                     }
 
-                    renderTrades();
-                    renderPositions();
+                    // [10] Debounced to avoid thrashing the table on rapid events
+                    renderTradesDebounced();
                     const tradeStatus = msg.data.status || 'pending';
                     toast(`Trade ${tradeStatus}: ${msg.data.trading_symbol || ''}`, tradeStatus === 'filled' ? 'success' : 'info');
                 }
@@ -330,7 +339,6 @@ function handleWSMessage(msg) {
             case 'order_update': {
                 const upd = msg.data;
 
-                // 1. Update signal card — by signal_id (now always provided by backend)
                 if (upd.signal_id) {
                     const sigIdx = state.signals.findIndex(s => s.id === upd.signal_id);
                     if (sigIdx !== -1) {
@@ -341,14 +349,12 @@ function handleWSMessage(msg) {
                     }
                 }
 
-                // 2. Update trade log entry by trade id
                 const trdIdx = state.trades.findIndex(t => (t.id === upd.id) || (t.trade_id === upd.id));
                 if (trdIdx !== -1) {
                     state.trades[trdIdx] = { ...state.trades[trdIdx], ...upd };
-                    renderTrades();
+                    renderTradesDebounced(); // [10]
                 }
 
-                // 3. Show a toast for replaced trades
                 if (upd.status === 'replaced') {
                     toast(`Order replaced: ${upd.trading_symbol || 'trade #' + upd.id}`, 'info');
                 }
@@ -356,14 +362,11 @@ function handleWSMessage(msg) {
             }
 
             case 'instrument_ltp':
-                // Live LTP for any subscribed instrument — update matching signal cards directly
                 if (msg.data.symbol) {
                     const incomingSymbol = msg.data.symbol.toUpperCase();
                     state.signals.forEach(s => {
                         const idxStr = (s.idx || s.index || 'SENSEX').toUpperCase().replace(/\s/g, '');
                         const suffixStr = `${s.strike}${s.option_type}`.toUpperCase().replace(/\s/g, '');
-                        
-                        // Match e.g. "SENSEX2631278500CE" and "SENSEX78500CE"
                         if (incomingSymbol.startsWith(idxStr) && incomingSymbol.endsWith(suffixStr)) {
                             s.live_ltp = msg.data.ltp;
                             const el = document.getElementById(`signal-ltp-${s.id}`);
@@ -374,22 +377,26 @@ function handleWSMessage(msg) {
                 break;
 
             case 'index_ltp':
-                // SENSEX index spot price — update matching signal cards directly
                 state.sensex_ltp = msg.data.ltp || 0;
-                const sensexEls = document.querySelectorAll('.signal-sensex-ltp');
-                sensexEls.forEach(el => {
+                document.querySelectorAll('.signal-sensex-ltp').forEach(el => {
                     el.textContent = (state.sensex_ltp || 0).toFixed(2);
                 });
                 break;
 
-            case 'position_update':
-                // Real-time PNL and SL updates
+            case 'position_update': {
                 const posIdx = state.positions.findIndex(p => p.id === msg.data.id);
                 if (posIdx !== -1) {
                     state.positions[posIdx] = { ...state.positions[posIdx], ...msg.data };
-                    renderPositions();
+                } else if (msg.data.status === 'open') {
+                    state.positions.unshift(msg.data);
                 }
+                // [5] Authoritative removal — driven by WS, not by exitPosition()
+                if (msg.data.status === 'closed') {
+                    state.positions = state.positions.filter(p => p.id !== msg.data.id);
+                }
+                renderPositions();
                 break;
+            }
 
             case 'settings_update':
                 if (msg.data.lot_size != null) {
@@ -425,10 +432,14 @@ async function fetchInitialData() {
         if (statusRes.ok) {
             const status = await statusRes.json();
             updateStatusFromData(status);
-            // Set lot size from server
             if (status.lot_size) {
                 const lotInput = $('#lot-input');
                 if (lotInput) lotInput.value = status.lot_size;
+            }
+            // [1] Load strategy from server if provided
+            if (status.strategy) {
+                state.strategy = { ...STRATEGY_DEFAULTS, ...status.strategy };
+                persistStrategy();
             }
         }
         if (msgsRes.ok) state.messages = await msgsRes.json();
@@ -513,7 +524,7 @@ async function sendTestSignal() {
             body: JSON.stringify({ text, sender: 'Test' }),
         });
         const result = await res.json();
-        
+
         if (result.signal && result.signal.status === 'valid') {
             toast('Test signal sent and validated!', 'success');
         } else if (result.signal && result.signal.status === 'ignored') {
@@ -521,7 +532,7 @@ async function sendTestSignal() {
         } else {
             toast('Test signal sent', 'success');
         }
-        
+
         $('#test-signal-input').value = '';
     } catch (e) {
         toast('Failed to send test', 'error');
@@ -533,11 +544,10 @@ async function exitPosition(positionId) {
     try {
         const res = await fetch(`${API_BASE}/api/positions/${positionId}/exit`, { method: 'POST' });
         const data = await res.json();
-        if (data.status === 'closed') {
-            // Remove from local state
-            state.positions = state.positions.filter(p => p.id !== positionId);
-            renderPositions();
-            toast(`Position closed — P&L: ₹${(data.pnl || 0).toFixed(2)}`, data.pnl >= 0 ? 'success' : 'warning');
+        if (data.status === 'closed' || data.status === 'ok') {
+            // [5] Do NOT remove from state here.
+            // The position_update WS event with status:'closed' is the authoritative signal.
+            toast(`Exit submitted — awaiting confirmation`, 'info');
         } else {
             toast(data.message || 'Failed to exit position', 'error');
         }
@@ -574,6 +584,7 @@ function renderAll() {
     renderTrades();
 }
 
+// [2] Fragment ordering fix: reverse new items before prepend so newest stays on top
 function renderMessages() {
     const container = $('#messages-list');
     const count = $('#msg-count');
@@ -585,22 +596,18 @@ function renderMessages() {
         return;
     }
 
-    // Clear empty state if present
     if (container.querySelector('.empty-state')) container.innerHTML = '';
 
-    // Rebuild only the DOM elements that don't exist
-    // For simplicity in this logic, we'll still clear and rebuild BUT 
-    // we use DocumentFragment to minimize flicker. 
-    // However, the best anti-flicker is to only add what's new.
-    
-    // Check if we already have these messages rendered
     const currentIds = new Set([...container.querySelectorAll('.msg-bubble')].map(el => el.dataset.id));
-    
-    const fragment = document.createDocumentFragment();
-    state.messages.forEach(m => {
-        const id = m.id || m.timestamp;
-        if (currentIds.has(String(id))) return;
+    const newItems = state.messages.filter(m => !currentIds.has(String(m.id || m.timestamp)));
 
+    if (newItems.length === 0) return;
+
+    // newItems[0] is newest (unshift order). We want newest at top after prepend.
+    // prepend() inserts in document order, so reverse so [0] ends up first.
+    const fragment = document.createDocumentFragment();
+    [...newItems].reverse().forEach(m => {
+        const id = m.id || m.timestamp;
         const div = document.createElement('div');
         div.className = 'msg-bubble';
         div.dataset.id = id;
@@ -612,11 +619,10 @@ function renderMessages() {
         fragment.appendChild(div);
     });
 
-    if (fragment.children.length > 0) {
-        container.prepend(fragment);
-    }
+    container.prepend(fragment);
 }
 
+// [8] Signals sorted by created_at before rendering; cards inserted in sorted DOM order
 function renderSignals() {
     try {
         const container = $('#signals-list');
@@ -631,7 +637,13 @@ function renderSignals() {
 
         if (container.querySelector('.empty-state')) container.innerHTML = '';
 
-        state.signals.forEach(s => {
+        const sorted = [...state.signals].sort((a, b) => {
+            const ta = new Date(a.created_at || a.timestamp || 0).getTime();
+            const tb = new Date(b.created_at || b.timestamp || 0).getTime();
+            return tb - ta;
+        });
+
+        sorted.forEach((s, idx) => {
             const existing = document.getElementById(`signal-card-${s.id}`);
             const status = s.status || 'empty';
             const isValid = status === 'valid';
@@ -641,9 +653,6 @@ function renderSignals() {
             const ltpVal = s.live_ltp ? `₹${s.live_ltp.toFixed(2)}` : '--';
             const sensexVal = state.sensex_ltp ? state.sensex_ltp.toFixed(2) : '--';
 
-
-
-            // Extract targets display
             let targetsText = '--';
             if (s.targets && Array.isArray(s.targets) && s.targets.length > 0) {
                 targetsText = s.targets.map(t => '₹' + t).join(', ');
@@ -653,49 +662,50 @@ function renderSignals() {
                     if (Array.isArray(tArr) && tArr.length > 0) {
                         targetsText = tArr.map(t => '₹' + t).join(', ');
                     }
-                } catch(e) {}
+                } catch (e) { }
             }
             const targetsHtml = `<div><span class="label">Targets</span><br><span class="value">${targetsText}</span></div>`;
 
             const cardHtml = `
-                    <div style="display: flex; justify-content: space-between; align-items: start;">
-                        <span class="signal-status ${s.status}">${s.status}</span>
-                        <div style="display: flex; gap: 6px; align-items: center;">
-                            ${isValid && timerStart && !['filled', 'closed', 'replaced', 'expired'].includes(tradeStatus) 
-                                ? `<span class="timer-tag" data-timer-start="${timerStart}" data-timer-mins="10" data-timer-label="Entry" data-trade-status="${tradeStatus}">⏳ Entry: --:--</span>` 
-                                : ''}
-                            ${tradeStatus && tradeStatus !== 'valid' ? `<span class="signal-status ${tradeStatus}">${tradeStatus}</span>` : ''}
-                        </div>
+                <div style="display: flex; justify-content: space-between; align-items: start;">
+                    <span class="signal-status ${s.status}">${s.status}</span>
+                    <div style="display: flex; gap: 6px; align-items: center;">
+                        ${isValid && timerStart && !['filled', 'closed', 'replaced', 'expired'].includes(tradeStatus)
+                    ? `<span class="timer-tag" data-timer-start="${timerStart}" data-timer-mins="10" data-timer-label="Entry" data-trade-status="${tradeStatus}">⏳ Entry: --:--</span>`
+                    : ''}
+                        ${tradeStatus && tradeStatus !== 'valid' ? `<span class="signal-status ${tradeStatus}">${tradeStatus}</span>` : ''}
                     </div>
-                    ${isValid && s.reason ? `<div class="signal-reason">${esc(s.reason)}</div>` : ''}
-                    ${isValid ? `
-                        <div class="signal-details">
-                            <div><span class="label">Index</span><br><span class="value">${esc(s.idx || s.index || '')}</span></div>
-                            <div><span class="label">Type</span><br><span class="value">${esc(s.option_type || '')}</span></div>
-                            <div><span class="label">Strike</span><br><span class="value">${esc(s.strike || '')}</span></div>
-                            <div><span class="label">Entry</span><br><span class="value">₹${s.entry_low || 0} - ₹${s.entry_high || 0}</span></div>
-                            <div><span class="label">SENSEX</span><br><span class="value ltp-live signal-sensex-ltp">${sensexVal}</span></div>
-                            <div><span class="label">LTP</span><br><span class="value ltp-live" id="signal-ltp-${s.id}">${ltpVal}</span></div>
-                            ${s.min_ltp ? `<div><span class="label">Min LTP</span><br><span class="value">₹${s.min_ltp}</span></div>` : ''}
-                            ${s.stoploss ? `<div><span class="label">SL</span><br><span class="value">₹${s.stoploss}</span></div>` : ''}
-                            ${targetsHtml}
-                        </div>
-                    ` : ''}
+                </div>
+                ${isValid && s.reason ? `<div class="signal-reason">${esc(s.reason)}</div>` : ''}
+                ${isValid ? `
+                    <div class="signal-details">
+                        <div><span class="label">Index</span><br><span class="value">${esc(s.idx || s.index || '')}</span></div>
+                        <div><span class="label">Type</span><br><span class="value">${esc(s.option_type || '')}</span></div>
+                        <div><span class="label">Strike</span><br><span class="value">${esc(s.strike || '')}</span></div>
+                        <div><span class="label">Entry</span><br><span class="value">₹${s.entry_low || 0} - ₹${s.entry_high || 0}</span></div>
+                        <div><span class="label">SENSEX</span><br><span class="value ltp-live signal-sensex-ltp">${sensexVal}</span></div>
+                        <div><span class="label">LTP</span><br><span class="value ltp-live" id="signal-ltp-${s.id}">${ltpVal}</span></div>
+                        ${s.min_ltp ? `<div><span class="label">Min LTP</span><br><span class="value">₹${s.min_ltp}</span></div>` : ''}
+                        ${s.stoploss ? `<div><span class="label">SL</span><br><span class="value">₹${s.stoploss}</span></div>` : ''}
+                        ${targetsHtml}
+                    </div>
+                ` : ''}
             `;
 
             if (existing) {
-                // Determine if we need to update content
-                // For simplicity, update innerHTML if basically anything changed 
-                // but keep the element ID to avoid jumpiness
                 existing.className = `signal-card ${tradeStatus || s.status}`;
                 existing.innerHTML = cardHtml;
+                // Enforce sorted DOM order
+                const currentIndex = [...container.children].indexOf(existing);
+                if (currentIndex !== idx) {
+                    container.insertBefore(existing, container.children[idx] || null);
+                }
             } else {
                 const div = document.createElement('div');
                 div.id = `signal-card-${s.id}`;
                 div.className = `signal-card ${tradeStatus || s.status}`;
                 div.innerHTML = cardHtml;
-                // Insertion logic (signals are usually in order)
-                container.prepend(div);
+                container.insertBefore(div, container.children[idx] || null);
             }
         });
     } catch (err) {
@@ -703,6 +713,7 @@ function renderSignals() {
     }
 }
 
+// [3][4] Upserts position cards in-place — preserves timer DOM elements, eliminates flicker
 function renderPositions() {
     const container = $('#positions-list');
     const count = $('#pos-count');
@@ -721,31 +732,48 @@ function renderPositions() {
         return;
     }
 
-    container.innerHTML = open.map(p => {
+    if (container.querySelector('.empty-state')) container.innerHTML = '';
+
+    // Remove stale cards
+    const openIds = new Set(open.map(p => String(p.id)));
+    container.querySelectorAll('.position-card').forEach(card => {
+        if (!openIds.has(card.dataset.posId)) card.remove();
+    });
+
+    open.forEach(p => {
         const pnl = p.pnl || 0;
         const pnlClass = pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : '';
+        const existing = container.querySelector(`.position-card[data-pos-id="${p.id}"]`);
 
-        let countdownStr = '';
-        if (p.opened_at) {
-            const cd = getCountdown(p.opened_at, 10);
-            if (cd) {
-                countdownStr = `<span class="timer-tag" data-timer-start="${p.opened_at}" data-timer-mins="10" data-timer-label="Hold">⏳ Hold: ${cd}</span>`;
+        if (existing) {
+            // Surgical updates only — do NOT replace innerHTML so timer elements survive
+            const pnlDiv = existing.querySelector('.pos-pnl');
+            if (pnlDiv) {
+                pnlDiv.textContent = `${pnl >= 0 ? '+' : ''}₹${pnl.toFixed(2)}`;
+                pnlDiv.className = `pos-pnl ${pnlClass}`;
             }
-        }
-
-        return `
-            <div class="position-card">
+            const ltpSpan = existing.querySelector('.pos-meta .mono');
+            if (ltpSpan) ltpSpan.textContent = `₹${(p.current_price || 0).toFixed(2)}`;
+            const slTag = existing.querySelector('.sl-tag');
+            if (slTag) slTag.textContent = `SL: ₹${(p.trailing_sl || 0).toFixed(2)}`;
+            const maxTag = existing.querySelector('.max-tag');
+            if (maxTag && p.max_ltp) maxTag.textContent = `Max: ₹${p.max_ltp.toFixed(2)}`;
+        } else {
+            const div = document.createElement('div');
+            div.className = 'position-card';
+            div.dataset.posId = String(p.id);
+            div.innerHTML = `
                 <div class="pos-info">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                         <span class="pos-symbol">${esc(p.trading_symbol || '')}</span>
                         <div style="display: flex; gap: 6px; align-items: center;">
-                            ${countdownStr}
+                            ${p.opened_at ? `<span class="timer-tag" data-timer-start="${p.opened_at}" data-timer-mins="10" data-timer-label="Hold">⏳ Hold: --:--</span>` : ''}
                             <button class="btn btn-exit" onclick="exitPosition(${p.id})" title="Exit this position">❌ Exit</button>
                         </div>
                     </div>
                     <span class="pos-meta">
-                        Qty: ${p.quantity || 0} | 
-                        Entry: ₹${(p.entry_price || 0).toFixed(2)} | 
+                        Qty: ${p.quantity || 0} |
+                        Entry: ₹${(p.entry_price || 0).toFixed(2)} |
                         LTP: <span class="mono">₹${(p.current_price || 0).toFixed(2)}</span>
                     </span>
                     <div class="pos-strategy">
@@ -754,9 +782,10 @@ function renderPositions() {
                     </div>
                 </div>
                 <div class="pos-pnl ${pnlClass}">${pnl >= 0 ? '+' : ''}₹${pnl.toFixed(2)}</div>
-            </div>
-        `;
-    }).join('');
+            `;
+            container.prepend(div);
+        }
+    });
 }
 
 function renderTrades() {
@@ -818,14 +847,42 @@ function updateStatusFromData(status) {
     updateModeUI();
     updateBadge('badge-telegram', status.telegram);
 
-    const isAuthenticated = status.kotak?.authenticated;
+    const kotak = status.kotak || {};
+    const isAuthenticated = kotak.authenticated;
     updateBadge('badge-kotak', isAuthenticated);
 
-    if (isAuthenticated) {
-        const otpRow = $('#otp-row');
-        if (otpRow) otpRow.style.display = 'none';
-        const statusText = $('#kotak-auth-status');
-        if (statusText) statusText.textContent = '✅ Authenticated';
+    const statusText = $('#kotak-auth-status');
+    const otpRow = $('#otp-row');
+
+    if (!statusText) return;
+
+    const loginState = kotak.login_state || (isAuthenticated ? 'logged_in' : 'unknown');
+    switch (loginState) {
+        case 'not_configured':
+            statusText.textContent = 'Kotak not configured';
+            if (otpRow) otpRow.style.display = 'none';
+            break;
+        case 'logging_in':
+            statusText.textContent = 'Logging in to Kotak...';
+            if (otpRow) otpRow.style.display = 'none';
+            break;
+        case 'logged_in':
+            statusText.textContent = '✅ Authenticated';
+            if (otpRow) otpRow.style.display = 'none';
+            break;
+        case 'login_failed':
+            statusText.textContent = kotak.last_error
+                ? `Login failed: ${kotak.last_error}`
+                : 'Login failed — see logs';
+            if (otpRow) otpRow.style.display = 'block';
+            break;
+        case 'dependency_missing':
+            statusText.textContent = 'Kotak deps missing (neo_api_client/pyotp)';
+            if (otpRow) otpRow.style.display = 'none';
+            break;
+        default:
+            statusText.textContent = isAuthenticated ? '✅ Authenticated' : 'Not authenticated';
+            break;
     }
 }
 
@@ -844,23 +901,14 @@ function updateBadge(id, connected) {
 }
 
 // ── Utilities ──
-function esc(str) {
-    const div = document.createElement('div');
-    div.textContent = str || '';
-    return div.innerHTML;
-}
-
 function formatTime(iso) {
     if (!iso) return '-';
     try {
         let dateStr = iso;
-        if (dateStr.includes(' ') && !dateStr.includes('T')) {
-            dateStr = dateStr.replace(' ', 'T');
-        }
+        if (dateStr.includes(' ') && !dateStr.includes('T')) dateStr = dateStr.replace(' ', 'T');
         if (dateStr.endsWith('+00:00')) dateStr = dateStr.replace('+00:00', 'Z');
         if (dateStr.endsWith('-00:00')) dateStr = dateStr.replace('-00:00', 'Z');
         if (!dateStr.endsWith('Z') && !dateStr.includes('+')) dateStr += 'Z';
-
         const d = new Date(dateStr);
         return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     } catch {
@@ -877,14 +925,11 @@ function getCountdown(isoStart, durationMinutes) {
         } else if (!dateStr.endsWith('Z') && !dateStr.includes('+')) {
             dateStr += 'Z';
         }
-
         const start = new Date(dateStr).getTime();
         const now = new Date().getTime();
         const target = start + (durationMinutes * 60 * 1000);
         const diff = target - now;
-
         if (diff <= 0) return null;
-
         const m = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
         const s = Math.floor((diff % (1000 * 60)) / 1000);
         return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
@@ -914,6 +959,7 @@ const STRATEGY_DEFAULTS = {
     slFixed: null,
 };
 
+// [1] localStorage is the fallback only — server strategy takes precedence (loaded in fetchInitialData / init WS event)
 function loadStrategy() {
     try {
         const saved = localStorage.getItem('tradebridge_strategy');
@@ -930,7 +976,11 @@ function loadStrategy() {
 }
 
 function persistStrategy() {
-    localStorage.setItem('tradebridge_strategy', JSON.stringify(state.strategy));
+    try {
+        localStorage.setItem('tradebridge_strategy', JSON.stringify(state.strategy));
+    } catch (e) {
+        console.warn('Could not persist strategy to localStorage:', e);
+    }
     updateStrategyButtonBadge();
 }
 
@@ -951,16 +1001,13 @@ function updateStrategyButtonBadge() {
 function syncStrategyModalToState() {
     const s = state.strategy;
 
-    // Lots dropdown
     const sel = $('#strategy-lots-select');
     if (sel) sel.value = s.lots;
 
-    // Lot pills
     $$('input[name="lots-quick"]').forEach(r => {
         r.checked = parseInt(r.value) === s.lots;
     });
 
-    // Entry logic
     $$('input[name="entry-logic"]').forEach(r => {
         r.checked = r.value === s.entryLogic;
     });
@@ -970,12 +1017,10 @@ function syncStrategyModalToState() {
     if (entryAvgRow) entryAvgRow.style.display = s.entryLogic === 'avg_signal' ? 'block' : 'none';
     const entryFixedInput = $('#entry-fixed-price');
     if (entryFixedInput && s.entryFixed) entryFixedInput.value = s.entryFixed;
-    // Restore avg sub-pick
     $$('input[name="entry-avg-pick"]').forEach(r => {
         r.checked = r.value === (s.entryAvgPick || 'avg');
     });
 
-    // Trailing SL
     $$('input[name="trailing-sl"]').forEach(r => {
         r.checked = r.value === s.trailingSL;
     });
@@ -997,7 +1042,6 @@ function populateLotDropdown() {
 }
 
 function bindStrategyModal() {
-    // Open button
     const btnStrategy = $('#btn-strategy');
     if (btnStrategy) {
         btnStrategy.addEventListener('click', () => {
@@ -1007,28 +1051,23 @@ function bindStrategyModal() {
         });
     }
 
-    // Close button
     const btnClose = $('#btn-close-strategy');
     if (btnClose) btnClose.addEventListener('click', () => {
         $('#strategy-modal').style.display = 'none';
     });
 
-    // Lots dropdown change
     const lotsSelect = $('#strategy-lots-select');
     if (lotsSelect) {
         lotsSelect.addEventListener('change', () => {
             const val = parseInt(lotsSelect.value);
-            // Deselect pills if not 1/5/10
             $$('input[name="lots-quick"]').forEach(r => {
                 r.checked = parseInt(r.value) === val;
             });
-            // Also sync header lot-input
             const lotInput = $('#lot-input');
             if (lotInput) lotInput.value = val;
         });
     }
 
-    // Lot pill clicks
     $$('input[name="lots-quick"]').forEach(radio => {
         radio.addEventListener('change', () => {
             const val = parseInt(radio.value);
@@ -1039,7 +1078,6 @@ function bindStrategyModal() {
         });
     });
 
-    // Entry Logic radios — show/hide fixed or avg-pick row
     $$('input[name="entry-logic"]').forEach(radio => {
         radio.addEventListener('change', () => {
             const fixedRow = $('#entry-fixed-row');
@@ -1049,7 +1087,6 @@ function bindStrategyModal() {
         });
     });
 
-    // Trailing SL radios — show/hide fixed input
     $$('input[name="trailing-sl"]').forEach(radio => {
         radio.addEventListener('change', () => {
             const fixedRow = $('#sl-fixed-row');
@@ -1057,7 +1094,6 @@ function bindStrategyModal() {
         });
     });
 
-    // Reset button
     const btnReset = $('#btn-strategy-reset');
     if (btnReset) {
         btnReset.addEventListener('click', () => {
@@ -1071,11 +1107,9 @@ function bindStrategyModal() {
         });
     }
 
-    // Save button
     const btnSave = $('#btn-strategy-save');
     if (btnSave) {
         btnSave.addEventListener('click', async () => {
-            // Read current values from modal
             const sel = $('#strategy-lots-select');
             const lots = sel ? parseInt(sel.value) : 1;
 
@@ -1101,11 +1135,9 @@ function bindStrategyModal() {
             state.strategy = { lots, entryLogic, entryAvgPick, entryFixed: entryFixedVal, trailingSL, slFixed: slFixedVal };
             persistStrategy();
 
-            // Sync header lot size
             const lotInput = $('#lot-input');
             if (lotInput) lotInput.value = lots;
 
-            // Push to backend
             try {
                 await fetch(`${API_BASE}/api/settings/strategy`, {
                     method: 'POST',
@@ -1113,11 +1145,9 @@ function bindStrategyModal() {
                     body: JSON.stringify(state.strategy),
                 });
             } catch (e) {
-                // Non-critical — settings saved locally regardless
                 console.warn('Could not sync strategy to backend:', e);
             }
 
-            // Also sync lot size to backend
             try {
                 await fetch(`${API_BASE}/api/settings/lot-size`, {
                     method: 'POST',
