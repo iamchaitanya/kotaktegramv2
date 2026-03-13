@@ -21,6 +21,7 @@ TICKS_DB_PATH = Path(__file__).parent.parent / "data" / "ticks.db"
 _ALLOWED_TRADE_FIELDS = {
     "status", "fill_price", "fill_time", "pnl", "order_id",
     "notes", "trigger_price", "price", "quantity", "min_ltp",
+    "exit_price",
 }
 
 _ALLOWED_POSITION_FIELDS = {
@@ -122,6 +123,7 @@ async def init_db():
             fill_time TEXT,
             pnl REAL DEFAULT 0,
             min_ltp REAL,
+            exit_price REAL,
             notes TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (signal_id) REFERENCES signals(id)
@@ -147,6 +149,15 @@ async def init_db():
         );
     """)
     await db.commit()
+
+    # ── Schema migrations (idempotent — safe to run on every startup) ──
+    # Add exit_price column if it doesn't exist yet (existing DBs won't have it)
+    try:
+        await db.execute("ALTER TABLE trades ADD COLUMN exit_price REAL")
+        await db.commit()
+        log.info("Migration: added exit_price column to trades table")
+    except Exception:
+        pass  # Column already exists — ignore
 
     ticks_db = await _get_ticks_db()
     await ticks_db.executescript("""

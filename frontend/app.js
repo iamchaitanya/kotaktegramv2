@@ -814,6 +814,7 @@ function renderTrades() {
                     <th>Qty</th>
                     <th>Price</th>
                     <th>Fill</th>
+                    <th>Exit</th>
                     <th>P&L</th>
                     <th>Mode</th>
                     <th>Status</th>
@@ -828,6 +829,7 @@ function renderTrades() {
                         <td class="mono">${t.quantity || '-'}</td>
                         <td class="mono">₹${(t.price || 0).toFixed(2)}</td>
                         <td class="mono">${t.fill_price ? '₹' + t.fill_price.toFixed(2) : '-'}</td>
+                        <td class="mono">${t.exit_price ? '₹' + Number(t.exit_price).toFixed(2) : '-'}</td>
                         <td class="mono" style="color: ${(t.pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'}">
                             ${t.pnl != null ? '₹' + t.pnl.toFixed(2) : '-'}
                         </td>

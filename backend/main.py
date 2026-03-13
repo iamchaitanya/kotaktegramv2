@@ -243,6 +243,12 @@ async def lifespan(app: FastAPI):
                 asyncio.create_task(tick_consumer())
                 log.info("Tick consumer task started")
 
+                # Load cached CSV immediately while live download runs
+                # This ensures signals have contracts available right away
+                cached = await loop.run_in_executor(None, manager.contract_master.load_cached)
+                if cached:
+                    log.info(f"Pre-loaded {len(manager.contract_master.get_all())} contracts from cached CSV")
+
                 await asyncio.sleep(3)
 
                 manager.market_feed.subscribe_batch([
@@ -284,7 +290,14 @@ async def lifespan(app: FastAPI):
                 if Config.KOTAK_CONSUMER_KEY:
                     log.info("⏰ 08:50 IST — refreshing contract master...")
                     await loop.run_in_executor(None, manager.initialize_kotak)
-                    login_result = await loop.run_in_executor(None, manager.login_kotak)
+                    # [12] Force reset session state before daily refresh so we get a
+                    # fresh Kotak session — reusing the old session causes scrip_master()
+                    # to return empty data, wiping the in-memory contract cache.
+                    def force_relogin():
+                        manager.kotak.is_authenticated = False
+                        manager.kotak.session_active = False
+                        return manager.login_kotak()
+                    login_result = await loop.run_in_executor(None, force_relogin)
                     if login_result.get("status") == "ok":
                         # [8] Stop feed before restarting to avoid duplicate callbacks
                         try:
@@ -292,8 +305,15 @@ async def lifespan(app: FastAPI):
                         except Exception as e:
                             log.warning(f"Could not stop market feed before refresh: {e}")
                         manager.market_feed.start()
+                        # Re-subscribe SENSEX index after restart
+                        manager.market_feed.subscribe_batch([
+                            {"instrument_token": "1", "exchange_segment": "bse_cm", "symbol": "SENSEX"},
+                            {"instrument_token": "999901", "exchange_segment": "bse_cm", "symbol": "SENSEX"},
+                            {"instrument_token": "50060", "exchange_segment": "bse_cm", "symbol": "SENSEX"},
+                        ])
                         # [2] Blocking download — offloaded to executor
                         await loop.run_in_executor(None, manager.download_contracts)
+                        await manager.resubscribe_recent_signals(limit=20)
                         log.info("✅ Daily contract master refresh complete")
                     else:
                         log.warning(f"Daily refresh login failed: {login_result.get('message')}")

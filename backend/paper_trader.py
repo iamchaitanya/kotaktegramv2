@@ -118,7 +118,7 @@ class PaperTrader:
     async def place_order(self, signal: dict, signal_id: int, lot_size: int = None, strategy: dict = None) -> dict:
         """Place a paper order that will fill when LTP enters entry range."""
         from .config import Config
-        qty = lot_size or int(Config.DEFAULT_LOT_SIZE)
+        qty = (lot_size or int(Config.DEFAULT_LOT_SIZE)) * 20  # 1 lot = 20 units for SENSEX
         strategy = strategy or {}
 
         sl_mode = strategy.get('trailingSL', 'code')
@@ -501,7 +501,7 @@ class PaperTrader:
                     "pnl": pnl,
                     "closed_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
                 })
-                await db.update_trade(pos["trade_id"], {"pnl": pnl})
+                await db.update_trade(pos["trade_id"], {"pnl": pnl, "exit_price": price})
 
                 # [7] Remove after DB writes to avoid race with square_off_all snapshot
                 if pos in self._open_positions:

@@ -26,7 +26,7 @@ class Config:
 
     # Trading
     TRADING_MODE = os.getenv("TRADING_MODE", "paper")  # paper | real
-    DEFAULT_LOT_SIZE = int(os.getenv("DEFAULT_LOT_SIZE", "15"))
+    DEFAULT_LOT_SIZE = int(os.getenv("DEFAULT_LOT_SIZE", "20"))
     MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "5000"))
 
     # Server
