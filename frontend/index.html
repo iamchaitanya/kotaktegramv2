@@ -54,6 +54,10 @@
                     <button class="btn btn-sm btn-secondary" id="btn-set-lots">Set</button>
                 </div>
                 <button class="btn btn-kill" id="btn-kill" title="Square off ALL positions">🛑 Kill All</button>
+                <div class="header-date-row">
+                    <input type="date" id="trade-date-picker" class="trade-date-input" title="Filter all panels by date">
+                    <button class="btn btn-sm btn-secondary" id="btn-load-all-trades" title="Show all history">All</button>
+                </div>
                 <button class="icon-btn" id="btn-clear" title="Clear Dashboard Data" style="color: #ef4444;">🗑️</button>
                 <button class="icon-btn" id="btn-refresh" title="Hard Refresh" onclick="location.reload(true)">🔄</button>
                 <button class="icon-btn" id="btn-strategy" title="Strategy Setup">🎯</button>
@@ -120,6 +124,7 @@
                     <button class="filter-btn" data-filter="pending">Pending</button>
                     <button class="filter-btn" data-filter="failed">Failed</button>
                 </div>
+
                 <div class="header-actions">
                     <span class="panel-count" id="trade-count">0</span>
                     <button class="panel-toggle" aria-label="Toggle Panel">▼</button>
@@ -161,8 +166,23 @@
                     </div>
                 </div>
 
-                <!-- Entry Logic Section -->
+                <!-- Compare Mode Section -->
                 <div class="settings-section">
+                    <h3>Compare Mode</h3>
+                    <label class="compare-toggle-row">
+                        <div class="toggle-switch">
+                            <input type="checkbox" id="strategy-compare-mode">
+                            <span class="toggle-slider"></span>
+                        </div>
+                        <div class="compare-toggle-text">
+                            <span class="option-title">🔬 Run All Entry Strategies</span>
+                            <span class="option-desc">Places 5 simultaneous orders (code, high, low, avg, fixed) on each signal so you can compare which entry performs best</span>
+                        </div>
+                    </label>
+                </div>
+
+                <!-- Entry Logic Section -->
+                <div class="settings-section" id="entry-logic-section">
                     <h3>Entry Logic</h3>
                     <div class="strategy-options" id="strategy-entry">
                         <label class="strategy-option">

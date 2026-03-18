@@ -15,121 +15,135 @@
  *  [9] Duplicate position insertion guarded correctly using position_id
  * [10] renderTrades() debounced at 100ms
  * [11] Modal overlay close uses event delegation on document instead of per-modal binding
- * [12] compareMode added — spawns all 5 entry strategies simultaneously for comparison
  */
-// ── Globals ──
-const API_BASE = window.location.origin;
-const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
 
-let ws = null;
-let reconnectTimer = null;
+const protocol = window.location.protocol;
+const host = window.location.host;
+const API_BASE = `${protocol}//${host}`;
+const WS_URL = `${protocol === 'https:' ? 'wss:' : 'ws:'}//${host}/ws`;
 
+// ── State ──
 const state = {
+    mode: 'paper',
     messages: [],
     signals: [],
     trades: [],
     positions: [],
-    mode: 'paper',
-    lotSize: 1,
-    strategy: {},
     tradeFilter: 'all',
-    selectedDate: null,  // null = today (set on init)
     wsConnected: false,
     sensex_ltp: 0,
+    strategy: {
+        lots: 1,
+        entryLogic: 'code',
+        entryAvgPick: 'avg',
+        entryFixed: null,
+        trailingSL: 'code',
+        slFixed: null,
+    },
 };
 
-// ── DOM Helpers ──
+let ws = null;
+let reconnectTimer = null;
+
+// ── DOM References ──
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
-const esc = (str) => String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
-// ── Timer tick (runs every second for countdown tags) ──
-let timerTickInterval = null;
-function startTimerTick() {
-    if (timerTickInterval) return;
-    timerTickInterval = setInterval(() => {
-        document.querySelectorAll('.timer-tag').forEach(el => {
-            const start = el.dataset.timerStart;
-            const mins = parseFloat(el.dataset.timerMins || 10);
-            const label = el.dataset.timerLabel || '';
-            const tradeStatus = el.dataset.tradeStatus || '';
-            if (['filled','closed','replaced','expired'].includes(tradeStatus)) {
-                el.style.display = 'none';
-                return;
-            }
-            const remaining = getCountdown(start, mins);
-            if (remaining === null) {
-                el.textContent = `⌛ ${label}: expired`;
-                el.style.opacity = '0.5';
-            } else {
-                el.textContent = `⏳ ${label}: ${remaining}`;
-                el.style.opacity = '1';
-            }
-        });
-    }, 1000);
+// ── [6] Cached escape element — avoids creating a new DOM node on every call ──
+const _escDiv = document.createElement('div');
+function esc(str) {
+    _escDiv.textContent = str || '';
+    return _escDiv.innerHTML;
 }
 
-// ── Debounced renderTrades ──
-let renderTradesTimer = null;
-function renderTradesDebounced() {
-    clearTimeout(renderTradesTimer);
-    renderTradesTimer = setTimeout(renderTrades, 150);
+// ── [10] Debounce helper ──
+function debounce(fn, ms) {
+    let timer;
+    return (...args) => {
+        clearTimeout(timer);
+        timer = setTimeout(() => fn(...args), ms);
+    };
 }
+const renderTradesDebounced = debounce(renderTrades, 100);
 
 // ── Init ──
 document.addEventListener('DOMContentLoaded', () => {
     loadStrategy();
-    fetchInitialData();
+    bindEvents();
     connectWebSocket();
-    startTimerTick();
-    bindEventListeners();
+    fetchInitialData();
+
+    setInterval(() => {
+        document.querySelectorAll('[data-timer-start]').forEach(el => {
+            const tradeStatus = el.getAttribute('data-trade-status') || '';
+            if (['filled', 'closed', 'replaced', 'expired'].includes(tradeStatus)) return;
+
+            const start = el.getAttribute('data-timer-start');
+            const mins = parseInt(el.getAttribute('data-timer-mins') || '10');
+            const label = el.getAttribute('data-timer-label') || 'Timer';
+            const countdown = getCountdown(start, mins);
+            if (countdown === null) {
+                el.textContent = `❌ EXPIRED`;
+                el.classList.add('expired');
+            } else {
+                el.textContent = `⏳ ${label}: ${countdown}`;
+            }
+        });
+    }, 1000);
 });
 
-// ── Event Listeners ──
-function bindEventListeners() {
+// ── Event Binding ──
+function bindEvents() {
     const hamburger = $('#btn-hamburger');
-    const menu = $('#header-menu');
-    if (hamburger && menu) {
-        hamburger.addEventListener('click', () => {
-            menu.classList.toggle('open');
-        });
-        document.addEventListener('click', (e) => {
-            if (!hamburger.contains(e.target) && !menu.contains(e.target)) {
-                menu.classList.remove('open');
-            }
-        });
-    }
-
-    $$('.mode-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            const mode = btn.dataset.mode;
-            if (mode === 'real') {
-                $('#confirm-real-modal').style.display = 'flex';
-            } else {
-                setMode(mode);
-            }
-        });
+    const headerMenu = $('#header-menu');
+    hamburger.addEventListener('click', () => {
+        headerMenu.classList.toggle('open');
+        hamburger.classList.toggle('open');
+    });
+    document.addEventListener('click', (e) => {
+        if (!e.target.closest('.header-right') && headerMenu.classList.contains('open')) {
+            headerMenu.classList.remove('open');
+            hamburger.classList.remove('open');
+        }
     });
 
-    $('#btn-confirm-real')?.addEventListener('click', () => {
+    $('#btn-paper').addEventListener('click', () => setMode('paper'));
+    $('#btn-real').addEventListener('click', () => {
+        $('#confirm-real-modal').style.display = 'flex';
+    });
+    $('#btn-confirm-real').addEventListener('click', () => {
+        $('#confirm-real-modal').style.display = 'none';
         setMode('real');
+    });
+    $('#btn-cancel-real').addEventListener('click', () => {
         $('#confirm-real-modal').style.display = 'none';
     });
 
-    $('#btn-cancel-real')?.addEventListener('click', () => {
-        $('#confirm-real-modal').style.display = 'none';
+    $('#btn-settings').addEventListener('click', () => {
+        $('#settings-modal').style.display = 'flex';
+    });
+    $('#btn-close-settings').addEventListener('click', () => {
+        $('#settings-modal').style.display = 'none';
     });
 
-    $('#btn-clear')?.addEventListener('click', async () => {
-        if (confirm('Clear all dashboard data? This cannot be undone.')) {
+    $$('.panel-header').forEach(header => {
+        header.addEventListener('click', () => {
+            if (window.innerWidth <= 768) {
+                const panel = header.closest('.panel');
+                panel.classList.toggle('collapsed');
+            }
+        });
+    });
+
+    $('#btn-clear').addEventListener('click', async () => {
+        if (confirm("Are you sure you want to completely clear the dashboard?\n\nThis will delete all messages, signals, trades, and positions.\n\nNote: Backtesting ticks will NOT be deleted.")) {
             try {
-                await fetch(`${API_BASE}/api/clear`, { method: 'POST' });
-                state.messages = [];
-                state.signals = [];
-                state.trades = [];
-                state.positions = [];
-                renderAll();
-                toast('Dashboard cleared', 'info');
+                const res = await fetch(`${API_BASE}/api/clear`, { method: 'POST' });
+                if (res.ok) {
+                    location.reload(true);
+                } else {
+                    toast('Failed to clear data', 'error');
+                }
             } catch (err) {
                 console.error('Clear error:', err);
                 toast('Error clearing data', 'error');
@@ -137,7 +151,7 @@ function bindEventListeners() {
         }
     });
 
-    $('#btn-kill')?.addEventListener('click', async () => {
+    $('#btn-kill').addEventListener('click', async () => {
         if (confirm('\u26a0\ufe0f KILL SWITCH\n\nThis will:\n\u2022 Close ALL open positions at current price\n\u2022 Cancel ALL pending orders\n\nAre you sure?')) {
             try {
                 const res = await fetch(`${API_BASE}/api/kill`, { method: 'POST' });
@@ -149,29 +163,15 @@ function bindEventListeners() {
         }
     });
 
-    $('#btn-set-lots')?.addEventListener('click', setLotSize);
-    $('#lot-input')?.addEventListener('keydown', (e) => {
+    $('#btn-set-lots').addEventListener('click', setLotSize);
+    $('#lot-input').addEventListener('keydown', (e) => {
         if (e.key === 'Enter') setLotSize();
     });
 
-    $('#btn-kotak-login')?.addEventListener('click', kotakLogin);
-    $('#btn-submit-otp')?.addEventListener('click', submitOTP);
-    $('#btn-send-test')?.addEventListener('click', sendTestSignal);
+    $('#btn-kotak-login').addEventListener('click', kotakLogin);
+    $('#btn-submit-otp').addEventListener('click', submitOTP);
 
-    // Date picker for trade log
-    const tradeDatePicker = $('#trade-date-picker');
-    if (tradeDatePicker) {
-        tradeDatePicker.addEventListener('change', () => {
-            if (tradeDatePicker.value) {
-                loadByDate(tradeDatePicker.value);
-            }
-        });
-    }
-    $('#btn-load-all-trades')?.addEventListener('click', () => {
-        const picker = $('#trade-date-picker');
-        if (picker) picker.value = '';
-        loadByDate('all');
-    });
+    $('#btn-send-test').addEventListener('click', sendTestSignal);
 
     $$('.filter-btn').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -182,6 +182,7 @@ function bindEventListeners() {
         });
     });
 
+    // [11] Single delegated modal-overlay close handler on document
     document.addEventListener('click', (e) => {
         if (e.target.classList.contains('modal-overlay')) {
             e.target.style.display = 'none';
@@ -197,6 +198,7 @@ function connectWebSocket() {
 
     ws = new WebSocket(WS_URL);
 
+    // [7] Attach pingInterval to the ws instance so onclose can clear the right one
     ws._pingInterval = setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'ping' }));
@@ -224,6 +226,7 @@ function connectWebSocket() {
 
     ws.onclose = () => {
         state.wsConnected = false;
+        // [7] Clear this connection's ping interval specifically
         clearInterval(ws._pingInterval);
         updateBadge('badge-ws', false);
         if (!reconnectTimer) {
@@ -254,6 +257,7 @@ function handleWSMessage(msg) {
                 state.trades = msg.data.trades || [];
                 state.positions = msg.data.positions || [];
                 updateStatusFromData(msg.data.status);
+                // [1] Prefer server-provided strategy over localStorage
                 if (msg.data.strategy) {
                     state.strategy = { ...STRATEGY_DEFAULTS, ...msg.data.strategy };
                     persistStrategy();
@@ -297,6 +301,7 @@ function handleWSMessage(msg) {
                     }
 
                     if (msg.data.status === 'filled') {
+                        // [9] Use position_id exclusively to guard against duplicates
                         const posId = msg.data.position_id;
                         if (posId && !state.positions.some(p => p.position_id === posId || p.id === posId)) {
                             state.positions.unshift(msg.data);
@@ -318,6 +323,7 @@ function handleWSMessage(msg) {
                         }
                     }
 
+                    // [10] Debounced to avoid thrashing the table on rapid events
                     renderTradesDebounced();
                     const tradeStatus = msg.data.status || 'pending';
                     toast(`Trade ${tradeStatus}: ${msg.data.trading_symbol || ''}`, tradeStatus === 'filled' ? 'success' : 'info');
@@ -332,6 +338,7 @@ function handleWSMessage(msg) {
 
             case 'order_update': {
                 const upd = msg.data;
+
                 if (upd.signal_id) {
                     const sigIdx = state.signals.findIndex(s => s.id === upd.signal_id);
                     if (sigIdx !== -1) {
@@ -341,11 +348,13 @@ function handleWSMessage(msg) {
                         renderSignals();
                     }
                 }
+
                 const trdIdx = state.trades.findIndex(t => (t.id === upd.id) || (t.trade_id === upd.id));
                 if (trdIdx !== -1) {
                     state.trades[trdIdx] = { ...state.trades[trdIdx], ...upd };
-                    renderTradesDebounced();
+                    renderTradesDebounced(); // [10]
                 }
+
                 if (upd.status === 'replaced') {
                     toast(`Order replaced: ${upd.trading_symbol || 'trade #' + upd.id}`, 'info');
                 }
@@ -381,6 +390,7 @@ function handleWSMessage(msg) {
                 } else if (msg.data.status === 'open') {
                     state.positions.unshift(msg.data);
                 }
+                // [5] Authoritative removal — driven by WS, not by exitPosition()
                 if (msg.data.status === 'closed') {
                     state.positions = state.positions.filter(p => p.id !== msg.data.id);
                 }
@@ -426,23 +436,15 @@ async function fetchInitialData() {
                 const lotInput = $('#lot-input');
                 if (lotInput) lotInput.value = status.lot_size;
             }
+            // [1] Load strategy from server if provided
             if (status.strategy) {
                 state.strategy = { ...STRATEGY_DEFAULTS, ...status.strategy };
                 persistStrategy();
             }
         }
-        if (msgsRes.ok) { state.messages = await msgsRes.json(); state.messages.reverse(); }
+        if (msgsRes.ok) state.messages = await msgsRes.json();
         if (sigsRes.ok) state.signals = await sigsRes.json();
-        if (tradesRes.ok) {
-            state.trades = await tradesRes.json();
-        }
-        // Set date picker to today after first load
-        if (!state.selectedDate) {
-            const today = new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD
-            state.selectedDate = today;
-            const picker = $('#trade-date-picker');
-            if (picker) picker.value = today;
-        }
+        if (tradesRes.ok) state.trades = await tradesRes.json();
         if (posRes.ok) state.positions = await posRes.json();
 
         renderAll();
@@ -543,6 +545,8 @@ async function exitPosition(positionId) {
         const res = await fetch(`${API_BASE}/api/positions/${positionId}/exit`, { method: 'POST' });
         const data = await res.json();
         if (data.status === 'closed' || data.status === 'ok') {
+            // [5] Do NOT remove from state here.
+            // The position_update WS event with status:'closed' is the authoritative signal.
             toast(`Exit submitted — awaiting confirmation`, 'info');
         } else {
             toast(data.message || 'Failed to exit position', 'error');
@@ -573,28 +577,6 @@ async function setLotSize() {
 }
 
 // ── Rendering ──
-async function loadByDate(date) {
-    try {
-        const dateParam = date === 'all' ? 'all' : date;
-        const [msgsRes, sigsRes, tradesRes] = await Promise.all([
-            fetch(`${API_BASE}/api/messages?date=${dateParam}&limit=200`),
-            fetch(`${API_BASE}/api/signals?date=${dateParam}&limit=200`),
-            fetch(`${API_BASE}/api/trades?date=${dateParam}&limit=500`),
-        ]);
-        if (msgsRes.ok) { state.messages = await msgsRes.json(); state.messages.reverse(); }
-        if (sigsRes.ok) state.signals = await sigsRes.json();
-        if (tradesRes.ok) state.trades = await tradesRes.json();
-        state.selectedDate = date;
-        renderMessages();
-        renderSignals();
-        renderTrades();
-        const label = date === 'all' ? 'all time' : date;
-        toast(`Showing data for: ${label}`, 'info');
-    } catch (e) {
-        toast('Failed to load data', 'error');
-    }
-}
-
 function renderAll() {
     renderMessages();
     renderSignals();
@@ -602,6 +584,7 @@ function renderAll() {
     renderTrades();
 }
 
+// [2] Fragment ordering fix: reverse new items before prepend so newest stays on top
 function renderMessages() {
     const container = $('#messages-list');
     const count = $('#msg-count');
@@ -620,6 +603,8 @@ function renderMessages() {
 
     if (newItems.length === 0) return;
 
+    // newItems[0] is newest (unshift order). We want newest at top after prepend.
+    // prepend() inserts in document order, so reverse so [0] ends up first.
     const fragment = document.createDocumentFragment();
     [...newItems].reverse().forEach(m => {
         const id = m.id || m.timestamp;
@@ -637,6 +622,7 @@ function renderMessages() {
     container.prepend(fragment);
 }
 
+// [8] Signals sorted by created_at before rendering; cards inserted in sorted DOM order
 function renderSignals() {
     try {
         const container = $('#signals-list');
@@ -709,6 +695,7 @@ function renderSignals() {
             if (existing) {
                 existing.className = `signal-card ${tradeStatus || s.status}`;
                 existing.innerHTML = cardHtml;
+                // Enforce sorted DOM order
                 const currentIndex = [...container.children].indexOf(existing);
                 if (currentIndex !== idx) {
                     container.insertBefore(existing, container.children[idx] || null);
@@ -726,6 +713,7 @@ function renderSignals() {
     }
 }
 
+// [3][4] Upserts position cards in-place — preserves timer DOM elements, eliminates flicker
 function renderPositions() {
     const container = $('#positions-list');
     const count = $('#pos-count');
@@ -746,6 +734,7 @@ function renderPositions() {
 
     if (container.querySelector('.empty-state')) container.innerHTML = '';
 
+    // Remove stale cards
     const openIds = new Set(open.map(p => String(p.id)));
     container.querySelectorAll('.position-card').forEach(card => {
         if (!openIds.has(card.dataset.posId)) card.remove();
@@ -757,6 +746,7 @@ function renderPositions() {
         const existing = container.querySelector(`.position-card[data-pos-id="${p.id}"]`);
 
         if (existing) {
+            // Surgical updates only — do NOT replace innerHTML so timer elements survive
             const pnlDiv = existing.querySelector('.pos-pnl');
             if (pnlDiv) {
                 pnlDiv.textContent = `${pnl >= 0 ? '+' : ''}₹${pnl.toFixed(2)}`;
@@ -820,7 +810,6 @@ function renderTrades() {
                 <tr>
                     <th>Time</th>
                     <th>Symbol</th>
-                    <th>Entry Mode</th>
                     <th>Side</th>
                     <th>Qty</th>
                     <th>Price</th>
@@ -836,7 +825,6 @@ function renderTrades() {
                     <tr>
                         <td class="mono">${formatTime(t.created_at || t.fill_time)}</td>
                         <td class="mono">${esc(t.trading_symbol || '-')}</td>
-                        <td><span class="entry-label-tag ${t.entry_label || ''}">${t.entry_label || '-'}</span></td>
                         <td>${t.transaction_type === 'B' ? '🟢 BUY' : '🔴 SELL'}</td>
                         <td class="mono">${t.quantity || '-'}</td>
                         <td class="mono">₹${(t.price || 0).toFixed(2)}</td>
@@ -971,9 +959,9 @@ const STRATEGY_DEFAULTS = {
     entryFixed: null,
     trailingSL: 'code',
     slFixed: null,
-    compareMode: false,   // [11] run all 5 entry modes simultaneously
 };
 
+// [1] localStorage is the fallback only — server strategy takes precedence (loaded in fetchInitialData / init WS event)
 function loadStrategy() {
     try {
         const saved = localStorage.getItem('tradebridge_strategy');
@@ -1004,23 +992,12 @@ function updateStrategyButtonBadge() {
     const isDefault = (
         state.strategy.lots === 1 &&
         state.strategy.entryLogic === 'code' &&
-        state.strategy.trailingSL === 'code' &&
-        !state.strategy.compareMode
+        state.strategy.trailingSL === 'code'
     );
     btn.classList.toggle('strategy-active', !isDefault);
-    const modeLabel = state.strategy.compareMode ? '🔬 Compare ALL' : state.strategy.entryLogic;
     btn.title = isDefault
         ? 'Strategy Setup'
-        : `Strategy: ${state.strategy.lots} lot(s) | Entry: ${modeLabel} | SL: ${state.strategy.trailingSL}`;
-}
-
-// [11] Dim/disable entry logic section when compare mode is on
-function toggleEntryLogicSection(compareOn) {
-    const section = $('#entry-logic-section');
-    if (section) {
-        section.style.opacity = compareOn ? '0.4' : '1';
-        section.style.pointerEvents = compareOn ? 'none' : '';
-    }
+        : `Strategy: ${state.strategy.lots} lot(s) | Entry: ${state.strategy.entryLogic} | SL: ${state.strategy.trailingSL}`;
 }
 
 function syncStrategyModalToState() {
@@ -1053,11 +1030,6 @@ function syncStrategyModalToState() {
     if (slFixedRow) slFixedRow.style.display = s.trailingSL === 'fixed' ? 'block' : 'none';
     const slFixedInput = $('#sl-fixed-price');
     if (slFixedInput && s.slFixed) slFixedInput.value = s.slFixed;
-
-    // [11] Sync compare mode toggle
-    const compareToggle = $('#strategy-compare-mode');
-    if (compareToggle) compareToggle.checked = !!s.compareMode;
-    toggleEntryLogicSection(!!s.compareMode);
 }
 
 function populateLotDropdown() {
@@ -1124,14 +1096,6 @@ function bindStrategyModal() {
         });
     });
 
-    // [11] Compare mode toggle — dims entry logic section when on
-    const compareToggle = $('#strategy-compare-mode');
-    if (compareToggle) {
-        compareToggle.addEventListener('change', () => {
-            toggleEntryLogicSection(compareToggle.checked);
-        });
-    }
-
     const btnReset = $('#btn-strategy-reset');
     if (btnReset) {
         btnReset.addEventListener('click', () => {
@@ -1161,10 +1125,7 @@ function bindStrategyModal() {
             const trailingSL = slRadio ? slRadio.value : 'code';
             const slFixedVal = trailingSL === 'fixed' ? (parseFloat($('#sl-fixed-price')?.value) || null) : null;
 
-            // [11] Read compare mode toggle
-            const compareMode = !!$('#strategy-compare-mode')?.checked;
-
-            if (!compareMode && entryLogic === 'fixed' && !entryFixedVal) {
+            if (entryLogic === 'fixed' && !entryFixedVal) {
                 toast('Please enter a fixed entry price', 'warning');
                 return;
             }
@@ -1173,7 +1134,7 @@ function bindStrategyModal() {
                 return;
             }
 
-            state.strategy = { lots, entryLogic, entryAvgPick, entryFixed: entryFixedVal, trailingSL, slFixed: slFixedVal, compareMode };
+            state.strategy = { lots, entryLogic, entryAvgPick, entryFixed: entryFixedVal, trailingSL, slFixed: slFixedVal };
             persistStrategy();
 
             const lotInput = $('#lot-input');
@@ -1199,10 +1160,8 @@ function bindStrategyModal() {
                 console.warn('Could not sync lot size to backend:', e);
             }
 
-            const modeLabel = compareMode ? '🔬 Compare ALL' : entryLogic;
-            toast(`Strategy saved: ${lots} lot(s) | Entry: ${modeLabel} | SL: ${trailingSL}`, 'success');
+            toast(`Strategy saved: ${lots} lot(s) | Entry: ${entryLogic} | SL: ${trailingSL}`, 'success');
             $('#strategy-modal').style.display = 'none';
         });
     }
 }
-/* CSS to add to style.css */

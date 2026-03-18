@@ -1,0 +1,9 @@
+{
+  "lots": 50,
+  "entryLogic": "avg_signal",
+  "entryAvgPick": "high",
+  "entryFixed": null,
+  "trailingSL": "fixed",
+  "slFixed": 5.0,
+  "compareMode": false
+}

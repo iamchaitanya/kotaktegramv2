@@ -29,10 +29,12 @@ class ContractMaster:
         return len(self._contracts) > 0
 
     def download(self, kotak_client) -> bool:
-        """Download the full scrip master from Kotak Neo and filter to SENSEX nearest-expiry options."""
+        """Download the full scrip master from Kotak Neo and filter to SENSEX nearest-expiry options.
+        On failure, falls back to the last saved CSV so trading continues uninterrupted.
+        """
         if not kotak_client or not kotak_client.client:
             log.warning("Cannot download contract master — Kotak client not available")
-            return False
+            return self._fallback_to_csv()
 
         try:
             log.info("Downloading scrip master from Kotak Neo...")
@@ -40,14 +42,14 @@ class ContractMaster:
 
             if not result:
                 log.error("scrip_master() returned empty result")
-                return False
+                return self._fallback_to_csv()
 
             # Parse the result — it may be a URL, CSV string, list of dicts, etc.
             contracts = self._parse_scrip_master(result)
 
             if not contracts:
                 log.error("No contracts parsed from scrip master")
-                return False
+                return self._fallback_to_csv()
 
             log.info(f"Total BSE FO contracts downloaded: {len(contracts)}")
 
@@ -60,13 +62,13 @@ class ContractMaster:
 
             if not sensex_contracts:
                 log.warning("No SENSEX options found in contract master!")
-                return False
+                return self._fallback_to_csv()
 
             # Find the nearest expiry
             nearest_expiry = self._find_nearest_expiry(sensex_contracts)
             if not nearest_expiry:
                 log.error("Could not determine nearest expiry")
-                return False
+                return self._fallback_to_csv()
 
             log.info(f"Nearest SENSEX expiry: {nearest_expiry}")
 
@@ -86,7 +88,21 @@ class ContractMaster:
 
         except Exception as e:
             log.error(f"Contract master download failed: {e}")
-            return False
+            return self._fallback_to_csv()
+
+    def _fallback_to_csv(self) -> bool:
+        """Fall back to the last saved CSV if the live download fails.
+        Ensures _contracts is never left empty after a failed refresh.
+        """
+        if self._contracts:
+            log.info(f"Download failed but {len(self._contracts)} contracts already in memory — keeping them")
+            return True
+        log.warning("Download failed and no contracts in memory — attempting CSV fallback")
+        return self._load_from_csv()
+
+    def load_cached(self) -> bool:
+        """Load contracts from the saved CSV file (called on startup before first live download)."""
+        return self._load_from_csv()
 
     def _parse_scrip_master(self, result) -> list[dict]:
         """Parse the scrip master result into a list of contract dicts.

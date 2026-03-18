@@ -3,8 +3,9 @@ Kotak Neo Trader — API wrapper for authentication and order management.
 Uses neo_api_client with the new access_token auth flow (no consumer_secret).
 """
 import logging
-from typing import Optional
+import time
 from datetime import datetime
+from typing import Optional
 
 try:
     from neo_api_client import NeoAPI
@@ -29,6 +30,7 @@ class KotakTrader:
         self.is_authenticated = False
         self.session_active = False
         self._last_login: Optional[datetime] = None
+        self._last_error: Optional[str] = None
 
     # ── Authentication ──
 
@@ -36,6 +38,7 @@ class KotakTrader:
         """Create NeoAPI client with consumer_key."""
         if NeoAPI is None:
             log.warning("neo_api_client not installed — running in offline mode")
+            self._last_error = "neo_api_client not installed"
             return False
 
         try:
@@ -46,53 +49,87 @@ class KotakTrader:
             log.info("NeoAPI client initialized")
             return True
         except Exception as e:
-            log.error(f"Failed to initialize NeoAPI: {e}")
+            msg = f"Failed to initialize NeoAPI: {e}"
+            log.error(msg)
+            self._last_error = str(e)
             return False
 
-    def login(self) -> dict:
-        """Step 1: totp_login — sends TOTP to Kotak."""
+    def login(self, retries: int = 1) -> dict:
+        """Authenticate with Kotak Neo using TOTP + MPIN.
+
+        Adds light retry logic and structured logging so we can distinguish
+        between config issues, dependency problems, and transient API failures.
+        """
+        # Short-circuit if we already have an active session
+        if self.session_active and self.is_authenticated:
+            log.info("Kotak login called but session is already active; reusing existing session.")
+            return {
+                "status": "ok",
+                "message": "Already authenticated",
+                "data": {"last_login": self._last_login.isoformat() if self._last_login else None},
+            }
+
         if not self.client:
             if not self.initialize():
                 return {"status": "error", "message": "Client not initialized"}
 
         # Auto-generate TOTP
-        if not Config.KOTAK_TOTP_SECRET or not pyotp:
+        if not Config.KOTAK_TOTP_SECRET:
+            self._last_error = "KOTAK_TOTP_SECRET not configured"
+            log.error("Cannot login — KOTAK_TOTP_SECRET not configured")
             return {"status": "error", "message": "KOTAK_TOTP_SECRET not configured"}
 
-        try:
-            import time
-            totp_code = pyotp.TOTP(Config.KOTAK_TOTP_SECRET).now()
-            log.info(f"Auto-generated TOTP code")
+        if not pyotp:
+            self._last_error = "pyotp not installed"
+            log.error("Cannot login — pyotp not installed")
+            return {"status": "error", "message": "pyotp not installed"}
 
-            result = self.client.totp_login(
-                mobile_number=Config.KOTAK_MOBILE_NUMBER,
-                ucc=Config.KOTAK_CLIENT_ID,
-                totp=totp_code,
-            )
-            log.info(f"totp_login result: {result}")
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                totp_code = pyotp.TOTP(Config.KOTAK_TOTP_SECRET).now()
+                log.info("Auto-generated TOTP code (len=%s) [attempt %s]", len(str(totp_code)), attempt)
 
-            # Check for error response (SDK sometimes uses 'Error' instead of 'error')
-            if isinstance(result, dict) and (result.get("error") or result.get("Error")):
-                raise Exception(str(result.get("error") or result.get("Error")))
+                result = self.client.totp_login(
+                    mobile_number=Config.KOTAK_MOBILE_NUMBER,
+                    ucc=Config.KOTAK_CLIENT_ID,
+                    totp=totp_code,
+                )
+                log.info("totp_login result: %s", result)
 
-            time.sleep(1)  # Brief pause for Kotak's backend
+                # Check for error response (SDK sometimes uses 'Error' instead of 'error')
+                if isinstance(result, dict) and (result.get("error") or result.get("Error")):
+                    raise Exception(str(result.get("error") or result.get("Error")))
 
-            # Step 2: Validate with MPIN
-            result2 = self.client.totp_validate(mpin=Config.KOTAK_MPIN)
-            log.info(f"totp_validate result: {result2}")
+                # Brief pause for Kotak's backend before validating MPIN
+                time.sleep(1)
 
-            if isinstance(result2, dict) and (result2.get("error") or result2.get("Error")):
-                raise Exception(str(result2.get("error") or result2.get("Error")))
+                # Step 2: Validate with MPIN
+                result2 = self.client.totp_validate(mpin=Config.KOTAK_MPIN)
+                log.info("totp_validate result: %s", result2)
 
-            self.is_authenticated = True
-            self.session_active = True
-            self._last_login = datetime.now()
-            log.info("✅ Kotak Neo login successful!")
-            return {"status": "ok", "message": "Authenticated successfully", "data": result2}
+                if isinstance(result2, dict) and (result2.get("error") or result2.get("Error")):
+                    raise Exception(str(result2.get("error") or result2.get("Error")))
 
-        except Exception as e:
-            log.error(f"Login failed: {e}")
-            return {"status": "error", "message": str(e)}
+                self.is_authenticated = True
+                self.session_active = True
+                self._last_login = datetime.now()
+                self._last_error = None
+                log.info("✅ Kotak Neo login successful!")
+                return {"status": "ok", "message": "Authenticated successfully", "data": result2}
+
+            except Exception as e:
+                self.is_authenticated = False
+                self.session_active = False
+                self._last_error = str(e)
+                log.error("Login failed on attempt %s: %s", attempt, e)
+
+                if attempt > retries:
+                    return {"status": "error", "message": str(e)}
+
+                # Simple bounded backoff before retrying
+                time.sleep(2)
 
     def complete_2fa(self, otp: str = None) -> dict:
         """Legacy 2FA — now handled automatically in login()."""
@@ -242,9 +279,22 @@ class KotakTrader:
 
     def get_status(self) -> dict:
         """Return connection/auth status."""
+        if not any(Config.kotak_env().values()):
+            login_state = "not_configured"
+        elif NeoAPI is None or pyotp is None:
+            login_state = "dependency_missing"
+        elif self.session_active and self.is_authenticated:
+            login_state = "logged_in"
+        elif self._last_error:
+            login_state = "login_failed"
+        else:
+            login_state = "unknown"
+
         return {
             "initialized": self.client is not None,
             "authenticated": self.is_authenticated,
             "session_active": self.session_active,
             "last_login": self._last_login.isoformat() if self._last_login else None,
+            "last_error": self._last_error,
+            "login_state": login_state,
         }
