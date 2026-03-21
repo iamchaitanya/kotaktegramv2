@@ -289,7 +289,11 @@ async def lifespan(app: FastAPI):
                             manager.market_feed.stop()
                         except Exception as e:
                             log.warning(f"Could not stop market feed before refresh: {e}")
+                        # Full reset for daily refresh — SDK owns reconnect, start() is enough
+                        manager.market_feed._started_once = False
                         manager.market_feed.start()
+                        # Subscriptions are queued and flushed automatically by _on_open
+                        # once is_hsw_open=1 is confirmed — no manual wait needed here
                         manager.market_feed.subscribe_batch([
                             {"instrument_token": "1", "exchange_segment": "bse_cm", "symbol": "SENSEX"},
                             {"instrument_token": "999901", "exchange_segment": "bse_cm", "symbol": "SENSEX"},
@@ -383,6 +387,8 @@ class StrategyRequest(BaseModel):
     trailingSL: str = 'code'
     slFixed: Optional[float] = None
     compareMode: bool = False  # [12] run all 5 entry modes simultaneously
+    activationPoints: Optional[float] = 5.0
+    trailGap: Optional[float] = 2.0
 
 
 # ── REST Endpoints ──

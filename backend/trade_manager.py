@@ -14,6 +14,7 @@ PATCHES APPLIED:
  [9] set_ws_broadcast comment clarified
 [10] new_message broadcast uses raw_text key for consistency with DB schema
 [11] compareMode added — spawns all 5 entry strategies simultaneously for comparison
+[14] signal_trail SL mode added to strategy defaults with activationPoints and trailGap
 """
 import asyncio
 import logging
@@ -53,14 +54,17 @@ class TradeManager:
 
         # [4] entryAvgPick added to defaults so all keys are always present
         # [11] compareMode: when True, all 5 entry strategies run simultaneously
+        # [14] activationPoints / trailGap: used by signal_trail SL mode
         self.strategy: Dict[str, Any] = {
             'lots': 1,
-            'entryLogic': 'code',    # 'code' | 'avg_signal' | 'fixed'
-            'entryAvgPick': 'avg',   # 'low' | 'avg' | 'high'  (for avg_signal mode)
+            'entryLogic': 'code',          # 'code' | 'avg_signal' | 'fixed'
+            'entryAvgPick': 'avg',         # 'low' | 'avg' | 'high'  (for avg_signal mode)
             'entryFixed': None,
-            'trailingSL': 'code',    # 'code' | 'signal' | 'ltp' | 'fixed'
+            'trailingSL': 'code',          # 'code' | 'signal' | 'ltp' | 'fixed' | 'signal_trail'
             'slFixed': None,
-            'compareMode': False,    # [11] when True, runs all 5 entry modes simultaneously
+            'activationPoints': 5.0,       # [14] signal_trail: pts above entry to activate trailing
+            'trailGap': 2.0,               # [14] signal_trail: pts behind LTP to trail SL
+            'compareMode': False,          # [11] when True, runs all 5 entry modes simultaneously
         }
 
         # [3] Keyed as "YYYY-MM-DD-strike-option_type" so the same strike is

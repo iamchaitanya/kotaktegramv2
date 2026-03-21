@@ -288,6 +288,7 @@ function handleWSMessage(msg) {
 
             case 'new_trade':
                 if (msg.data) {
+                    if (msg.data.status === 'closed') break;
                     const newTradeId = msg.data.trade_id || msg.data.id;
                     const existingIdx = state.trades.findIndex(t => (t.trade_id || t.id) === newTradeId);
                     if (existingIdx !== -1) {
@@ -296,11 +297,18 @@ function handleWSMessage(msg) {
                         state.trades.unshift(msg.data);
                     }
 
-                    if (msg.data.status === 'filled') {
+                    if (msg.data.status === 'open') {
                         const posId = msg.data.position_id;
                         if (posId && !state.positions.some(p => p.position_id === posId || p.id === posId)) {
-                            state.positions.unshift(msg.data);
-                            renderPositions();
+    const entryPrice = msg.data.entry_price || msg.data.fill_price;
+    if (!entryPrice) console.warn('[new_trade] No entry/fill price on trade:', msg.data);
+    state.positions.unshift({
+        ...msg.data,
+        id: posId,
+        entry_price: entryPrice || 0,
+    });
+    renderPositions();
+}
                         }
                         if (msg.data.signal_id) {
                             const sigIdx = state.signals.findIndex(s => s.id === msg.data.signal_id);
@@ -1053,6 +1061,12 @@ function syncStrategyModalToState() {
     if (slFixedRow) slFixedRow.style.display = s.trailingSL === 'fixed' ? 'block' : 'none';
     const slFixedInput = $('#sl-fixed-price');
     if (slFixedInput && s.slFixed) slFixedInput.value = s.slFixed;
+    const slSignalTrailRow = $('#sl-signal-trail-row');
+    if (slSignalTrailRow) slSignalTrailRow.style.display = s.trailingSL === 'signal_trail' ? 'block' : 'none';
+    const actInput = $('#sl-activation-points');
+    if (actInput) actInput.value = s.activationPoints ?? 5;
+    const gapInput = $('#sl-trail-gap');
+    if (gapInput) gapInput.value = s.trailGap ?? 2;
 
     // [11] Sync compare mode toggle
     const compareToggle = $('#strategy-compare-mode');
@@ -1121,6 +1135,8 @@ function bindStrategyModal() {
         radio.addEventListener('change', () => {
             const fixedRow = $('#sl-fixed-row');
             if (fixedRow) fixedRow.style.display = radio.value === 'fixed' ? 'block' : 'none';
+            const signalTrailRow = $('#sl-signal-trail-row');
+            if (signalTrailRow) signalTrailRow.style.display = radio.value === 'signal_trail' ? 'block' : 'none';
         });
     });
 
@@ -1160,6 +1176,8 @@ function bindStrategyModal() {
             const slRadio = document.querySelector('input[name="trailing-sl"]:checked');
             const trailingSL = slRadio ? slRadio.value : 'code';
             const slFixedVal = trailingSL === 'fixed' ? (parseFloat($('#sl-fixed-price')?.value) || null) : null;
+            const activationPoints = trailingSL === 'signal_trail' ? (parseFloat($('#sl-activation-points')?.value) || 5) : null;
+            const trailGap = trailingSL === 'signal_trail' ? (parseFloat($('#sl-trail-gap')?.value) || 2) : null;
 
             // [11] Read compare mode toggle
             const compareMode = !!$('#strategy-compare-mode')?.checked;
@@ -1172,8 +1190,12 @@ function bindStrategyModal() {
                 toast('Please enter a fixed SL price', 'warning');
                 return;
             }
+            if (trailingSL === 'signal_trail' && (!activationPoints || !trailGap)) {
+                toast('Please enter activation pts and trail gap for Signal Trail', 'warning');
+                return;
+            }
 
-            state.strategy = { lots, entryLogic, entryAvgPick, entryFixed: entryFixedVal, trailingSL, slFixed: slFixedVal, compareMode };
+            state.strategy = { lots, entryLogic, entryAvgPick, entryFixed: entryFixedVal, trailingSL, slFixed: slFixedVal, activationPoints, trailGap, compareMode };
             persistStrategy();
 
             const lotInput = $('#lot-input');

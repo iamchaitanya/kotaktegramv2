@@ -1,9 +1,11 @@
 {
   "lots": 50,
-  "entryLogic": "avg_signal",
-  "entryAvgPick": "high",
+  "entryLogic": "code",
+  "entryAvgPick": "avg",
   "entryFixed": null,
-  "trailingSL": "fixed",
-  "slFixed": 5.0,
-  "compareMode": false
+  "trailingSL": "signal_trail",
+  "slFixed": null,
+  "compareMode": true,
+  "activationPoints": 5.0,
+  "trailGap": 2.0
 }

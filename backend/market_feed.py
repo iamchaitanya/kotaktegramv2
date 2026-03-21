@@ -6,15 +6,17 @@ Stores every tick for backtesting.
 PATCHES APPLIED:
  [1] Singleton _loop captured via get_running_loop() at start() time
  [2] _flush_tick_buffer uses stored _loop instead of deprecated get_event_loop()
- [3] _on_close triggers automatic reconnect via background thread
+ [3] REMOVED — our reconnect loop ripped out. SDK's run_forever(reconnect=5) handles reconnect.
  [4] stop() method for clean shutdown / pre-refresh teardown
- [5] Reconnect has exponential backoff with max 60s cap
- [6] Reconnect lock prevents multiple concurrent reconnect threads
- [7] start() no longer resets _should_reconnect — stop() is always respected
+ [5] REMOVED — no reconnect loop to backoff
+ [6] REMOVED — no reconnect loop to lock
+ [7] REMOVED — no reconnect loop to guard
  [8] Pending subs use a set-merge so reconnects never lose subscriptions
- [9] WS open confirmation timeout — if _on_open never fires, retry
+ [9] REMOVED — no reconnect loop waiting for open event
 [10] Tick buffer flushed on disconnect so no ticks are lost
-[11] Heartbeat watchdog — detects silent dead feed and forces reconnect
+[11] Heartbeat watchdog — detects silent dead feed. On stale: force-closes WS so
+     SDK's own reconnect=5 fires a fresh connection.
+[12] SDK owns reconnect. _on_close is now OBSERVATION ONLY — no thread spawning.
 """
 import asyncio
 import logging
@@ -28,9 +30,6 @@ from . import database as db
 log = logging.getLogger(__name__)
 
 TICK_BUFFER_SIZE = 50        # Flush to DB every N ticks
-RECONNECT_BASE_DELAY = 5     # Initial reconnect wait (seconds)
-RECONNECT_MAX_DELAY = 60     # Maximum reconnect wait (seconds)
-WS_OPEN_TIMEOUT = 30         # [9]  Seconds to wait for _on_open before retrying
 HEARTBEAT_INTERVAL = 30      # [11] Seconds between watchdog checks
 HEARTBEAT_STALE_THRESHOLD = 120  # [11] Seconds without a tick = dead feed
 
@@ -47,13 +46,9 @@ class MarketFeed:
         self._tick_buffer: list[dict] = []
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pending_subs: list[dict] = []
-        self._reconnect_attempts = 0
-        self._should_reconnect = True
-        self._reconnect_lock = threading.Lock()       # [6]
-        self._ws_open_event = threading.Event()       # [9]
         self._last_tick_time: float = 0.0             # [11]
         self._heartbeat_thread: threading.Thread | None = None  # [11]
-        self._started_once = False                    # tracks if start() was ever called
+        self._started_once = False
 
     @property
     def is_running(self) -> bool:
@@ -68,7 +63,10 @@ class MarketFeed:
     # ── Lifecycle ──
 
     def start(self):
-        """Set up websocket callbacks with Kotak Neo. Call once after login."""
+        """Set up websocket callbacks with Kotak Neo. Call ONCE after login.
+        The SDK's run_forever(reconnect=5) handles all subsequent reconnects —
+        do NOT call start() again on disconnect.
+        """
         # [1] Capture the running loop
         try:
             self._loop = asyncio.get_running_loop()
@@ -82,14 +80,12 @@ class MarketFeed:
             log.warning("Cannot start market feed — Kotak not authenticated")
             return False
 
-        # [7] Never override an intentional stop()
-        # Only set _should_reconnect=True on the very first start
-        if not self._started_once:
-            self._should_reconnect = True
-            self._started_once = True
+        if self._started_once:
+            log.warning("start() called more than once — ignoring. SDK handles reconnect internally.")
+            return False
+        self._started_once = True
 
         try:
-            self._ws_open_event.clear()  # [9] Reset before each start attempt
             self.kotak.setup_callbacks(
                 on_message=self._on_message,
                 on_error=self._on_error,
@@ -97,10 +93,9 @@ class MarketFeed:
                 on_open=self._on_open,
             )
             self._running = True
-            self._reconnect_attempts = 0
-            log.info("Market feed: callbacks registered")
+            log.info("Market feed: callbacks registered, SDK will maintain connection")
 
-            # [11] Start heartbeat watchdog on first start
+            # [11] Start heartbeat watchdog once
             if self._heartbeat_thread is None or not self._heartbeat_thread.is_alive():
                 self._heartbeat_thread = threading.Thread(
                     target=self._heartbeat_watchdog, daemon=True
@@ -115,9 +110,7 @@ class MarketFeed:
 
     def stop(self):
         """[4] Intentionally stop the market feed (no reconnect)."""
-        self._should_reconnect = False  # [7] Must be set BEFORE _running=False
         self._running = False
-        self._reconnect_attempts = 0
         self._flush_tick_buffer()       # [10] Flush remaining ticks on stop
         log.info("Market feed stopped intentionally")
 
@@ -189,19 +182,6 @@ class MarketFeed:
                 except Exception as e:
                     log.error(f"Unsubscribe failed: {e}")
 
-    def _resubscribe_all(self):
-        if not self.kotak or not self._subscriptions:
-            return
-        sub_list = [
-            {"instrument_token": tk, "exchange_segment": info.get("exchange_segment", "bse_fo")}
-            for tk, info in self._subscriptions.items()
-        ]
-        try:
-            self.kotak.subscribe(instrument_tokens=sub_list)
-            log.info(f"Re-subscribed to {len(sub_list)} instruments after reconnect")
-        except Exception as e:
-            log.error(f"Re-subscribe after reconnect failed: {e}")
-
     # ── Data Access ──
 
     def get_ltp(self, token: str) -> float:
@@ -230,139 +210,118 @@ class MarketFeed:
         log.error(f"Market feed WS error: {error}")
 
     def _on_close(self, message):
-        """[3][6][10] WS closed — flush buffer, then reconnect if allowed."""
-        log.warning(f"Market feed WS closed: {message}")
+        """[12] WS closed — observation only. SDK's run_forever(reconnect=5) will reconnect.
+        We flush the tick buffer and update state. No thread spawning here.
+        """
+        log.warning(f"WS closed: {message} — SDK will auto-reconnect in ~5s")
         self._running = False
         self._flush_tick_buffer()  # [10] Don't lose buffered ticks
-
-        if not self._should_reconnect:
-            log.info("Reconnect disabled — not attempting reconnect")
-            return
-
-        # [6] Only one reconnect thread at a time
-        if self._reconnect_lock.locked():
-            log.warning("Reconnect already in progress — ignoring duplicate close event")
-            return
-
-        thread = threading.Thread(target=self._reconnect_loop, daemon=True)
-        thread.start()
-
-    def _reconnect_loop(self):
-        """[3][5][6][7][9] Reconnect with exponential backoff. Holds lock for duration."""
-        with self._reconnect_lock:
-            while self._should_reconnect and not self._running:
-                self._reconnect_attempts += 1
-                delay = min(
-                    RECONNECT_BASE_DELAY * (2 ** (self._reconnect_attempts - 1)),
-                    RECONNECT_MAX_DELAY,
-                )
-                log.info(f"Market feed reconnect attempt #{self._reconnect_attempts} in {delay}s...")
-                time.sleep(delay)
-
-                if not self._should_reconnect:
-                    break
-
-                try:
-                    # [7] Re-login only if session truly dropped
-                    if self.kotak:
-                        login_result = self.kotak.login()
-                        # kotak_trader.login() always returns {"status": "ok"} on success
-                        if isinstance(login_result, dict) and login_result.get("status") == "ok":
-                            log.info("Kotak re-login successful for reconnect")
-                        else:
-                            log.warning(f"Kotak re-login failed: {login_result}")
-                            continue
-
-                    if not self.start():
-                        log.warning("Market feed start() failed — will retry")
-                        continue
-
-                    # [9] Wait for _on_open confirmation before declaring success
-                    log.info(f"Waiting up to {WS_OPEN_TIMEOUT}s for WS open confirmation...")
-                    opened = self._ws_open_event.wait(timeout=WS_OPEN_TIMEOUT)
-                    if not opened:
-                        log.warning(f"WS did not open within {WS_OPEN_TIMEOUT}s — retrying")
-                        self._running = False
-                        continue
-
-                    # [8] Queue ALL known subscriptions for _on_open to flush
-                    known_subs = [
-                        {"instrument_token": tk, "exchange_segment": info.get("exchange_segment", "bse_fo")}
-                        for tk, info in self._subscriptions.items()
-                    ]
-                    existing_keys = {(s["instrument_token"], s["exchange_segment"]) for s in self._pending_subs}
-                    for s in known_subs:
-                        if (s["instrument_token"], s["exchange_segment"]) not in existing_keys:
-                            self._pending_subs.append(s)
-
-                    log.info("✅ Market feed reconnected successfully!")
-                    self._reconnect_attempts = 0
-                    break
-
-                except Exception as e:
-                    log.error(f"Reconnect attempt #{self._reconnect_attempts} failed: {e}")
+        # SDK reconnects automatically — _on_open will fire when it's back up
 
     def _on_open(self, message):
-        """[9] WS opened — signal the reconnect loop and flush pending subs."""
+        """WS opened (initial or SDK auto-reconnect) — update state and flush pending subs.
+
+        CRITICAL: Do NOT call kotak.subscribe() here directly.
+        The SDK's NeoWebSocket.on_hsm_message handles the 'cn' handshake and then
+        calls subscribe_scripts() automatically for any items already in sub_list.
+        Calling subscribe() here risks spawning a second WS thread if is_hsw_open
+        is not yet 1 (handshake not complete), which overwrites the global ws and
+        causes the death loop.
+
+        Instead: merge known subscriptions into _pending_subs, then let
+        _flush_pending_subs_when_ready() poll until is_hsw_open==1 before sending.
+        """
         log.info(f"Market feed WS opened: {message}")
         self._running = True
-        self._reconnect_attempts = 0
         self._last_tick_time = time.time()  # [11] Reset watchdog on open
-        self._ws_open_event.set()           # [9] Signal reconnect loop
 
-        if self._pending_subs and self.kotak:
-            subs_to_flush = list(self._pending_subs)
-            self._pending_subs.clear()
-            log.info(f"Flushing {len(subs_to_flush)} queued subscriptions...")
+        # Merge all known subscriptions into pending so they get flushed once ready
+        known_subs = [
+            {"instrument_token": tk, "exchange_segment": info.get("exchange_segment", "bse_fo")}
+            for tk, info in self._subscriptions.items()
+        ]
+        existing_keys = {(s["instrument_token"], s["exchange_segment"]) for s in self._pending_subs}
+        for s in known_subs:
+            if (s["instrument_token"], s["exchange_segment"]) not in existing_keys:
+                self._pending_subs.append(s)
+
+        if self._pending_subs:
+            thread = threading.Thread(target=self._flush_pending_subs_when_ready, daemon=True)
+            thread.start()
+
+    def _flush_pending_subs_when_ready(self):
+        """Poll until NeoWebSocket.is_hsw_open==1, then send pending subscriptions.
+        This avoids calling subscribe() before the SDK handshake is complete,
+        which would spawn a second WS thread and corrupt the global ws variable.
+        """
+        deadline = time.time() + 15  # wait up to 15s for handshake
+        while time.time() < deadline:
             try:
-                self.kotak.subscribe(instrument_tokens=subs_to_flush)
-                log.info(f"Flushed {len(subs_to_flush)} queued subscriptions")
-            except Exception as e:
-                log.error(f"Failed to flush queued subscriptions: {e}")
-                # [8] Put them back so next reconnect retries them
-                self._pending_subs.extend(subs_to_flush)
+                neo_ws = self.kotak.client.NeoWebSocket
+                if neo_ws and neo_ws.is_hsw_open == 1:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+        else:
+            log.warning("NeoWebSocket did not reach is_hsw_open=1 within 15s — skipping flush")
+            return
+
+        if not self._pending_subs or not self.kotak:
+            return
+
+        subs_to_flush = list(self._pending_subs)
+        self._pending_subs.clear()
+        log.info(f"Flushing {len(subs_to_flush)} subscriptions (is_hsw_open=1 confirmed)...")
+        try:
+            self.kotak.subscribe(instrument_tokens=subs_to_flush)
+            log.info(f"✅ Flushed {len(subs_to_flush)} subscriptions")
+        except Exception as e:
+            log.error(f"Failed to flush subscriptions: {e}")
+            self._pending_subs.extend(subs_to_flush)  # [8] Put back for next open
 
     # ── Heartbeat Watchdog ──
 
     def _heartbeat_watchdog(self):
         """[11] Periodically checks if ticks are still arriving.
-        If feed goes silent for HEARTBEAT_STALE_THRESHOLD seconds during
-        market hours, forces a reconnect.
+        If feed goes silent for HEARTBEAT_STALE_THRESHOLD seconds during market hours,
+        closes the WS so the SDK's own reconnect=5 kicks in fresh.
+        We do NOT spawn our own reconnect — we just poke the SDK's.
         """
         log.info("Heartbeat watchdog running")
         while True:
             time.sleep(HEARTBEAT_INTERVAL)
 
-            if not self._should_reconnect:
-                log.info("Heartbeat watchdog stopping — feed intentionally stopped")
-                break
-
             if not self._running:
-                continue  # Reconnect loop will handle it
+                continue  # SDK will reconnect, _on_open will set _running=True again
 
             if self._last_tick_time == 0:
                 continue  # No ticks received yet since startup
 
-            # Only check during market hours (9:00 - 15:35 IST = 3:30 - 10:05 UTC)
+            # Only check during market hours (9:00–15:35 IST = 3:30–10:05 UTC)
             now_utc = datetime.now(timezone.utc)
             utc_hour = now_utc.hour + now_utc.minute / 60
             if not (3.5 <= utc_hour <= 10.1):
-                continue  # Outside market hours — silence is expected
+                continue
 
             elapsed = time.time() - self._last_tick_time
             if elapsed > HEARTBEAT_STALE_THRESHOLD:
                 log.warning(
-                    f"⚠️ No ticks received for {elapsed:.0f}s — feed appears dead. "
-                    f"Forcing reconnect..."
+                    f"⚠️ No ticks for {elapsed:.0f}s — feed appears dead. "
+                    f"Closing WS so SDK reconnect fires..."
                 )
                 self._running = False
-                self._flush_tick_buffer()  # [10]
-
-                if not self._reconnect_lock.locked():
-                    thread = threading.Thread(target=self._reconnect_loop, daemon=True)
-                    thread.start()
-                else:
-                    log.info("Reconnect already in progress — watchdog skipping")
+                self._flush_tick_buffer()
+                # Force-close the underlying websocket so SDK's reconnect=5 triggers
+                try:
+                    from neo_api_client.HSWebSocketLib import ws as sdk_ws
+                    if sdk_ws:
+                        sdk_ws.close()
+                        log.info("Forced WS close — SDK will reconnect in ~5s")
+                except Exception as e:
+                    log.warning(f"Could not force-close SDK WS: {e}")
+                # Reset so watchdog doesn't fire again immediately
+                self._last_tick_time = time.time()
 
     # ── Tick Processing ──
 

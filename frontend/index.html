@@ -264,6 +264,23 @@
                         <div class="strategy-suboption" id="sl-fixed-row" style="display:none;">
                             <input type="number" id="sl-fixed-price" class="strategy-number-input" placeholder="e.g. 5 (points)" min="1" max="9999">
                         </div>
+                        <label class="strategy-option">
+                            <input type="radio" name="trailing-sl" value="signal_trail">
+                            <div class="option-content">
+                                <span class="option-title">🎯 Signal Trail</span>
+                                <span class="option-desc">SL = signal SL until activation pts gained, then trails by gap</span>
+                            </div>
+                        </label>
+                        <div class="strategy-suboption" id="sl-signal-trail-row" style="display:none;">
+                            <label style="font-size:12px; color:var(--text-muted); display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+                                Activation pts:
+                                <input type="number" id="sl-activation-points" class="strategy-number-input" placeholder="e.g. 5" min="1" max="999" style="width:80px;">
+                            </label>
+                            <label style="font-size:12px; color:var(--text-muted); display:flex; align-items:center; gap:8px;">
+                                Trail gap pts:
+                                <input type="number" id="sl-trail-gap" class="strategy-number-input" placeholder="e.g. 2" min="1" max="999" style="width:80px;">
+                            </label>
+                        </div>
                     </div>
                 </div>
 
@@ -325,7 +342,7 @@
     <!-- ── Toast Container ── -->
     <div id="toast-container"></div>
 
-    <script src="app.js?v=5"></script>
+    <script src="app.js?v=6"></script>
 </body>
 
 </html>
