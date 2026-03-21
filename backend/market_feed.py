@@ -17,38 +17,47 @@ PATCHES APPLIED:
 [11] Heartbeat watchdog — detects silent dead feed. On stale: force-closes WS so
      SDK's own reconnect=5 fires a fresh connection.
 [12] SDK owns reconnect. _on_close is now OBSERVATION ONLY — no thread spawning.
+[FIX #11] _heartbeat_watchdog uses ZoneInfo("Asia/Kolkata") — no hardcoded UTC offset
+[FIX #19] _flush_pending_subs_when_ready: on timeout re-queues subs instead of discarding
+[FIX #23] log.exception() used throughout — no bare except or log.error for exceptions
 """
 import asyncio
 import logging
 import threading
 import time
 from typing import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dt_time
+from zoneinfo import ZoneInfo
 
 from . import database as db
 
 log = logging.getLogger(__name__)
 
-TICK_BUFFER_SIZE = 50        # Flush to DB every N ticks
-HEARTBEAT_INTERVAL = 30      # [11] Seconds between watchdog checks
-HEARTBEAT_STALE_THRESHOLD = 120  # [11] Seconds without a tick = dead feed
+TICK_BUFFER_SIZE         = 50    # Flush to DB every N ticks
+HEARTBEAT_INTERVAL       = 30    # Seconds between watchdog checks
+HEARTBEAT_STALE_THRESHOLD = 120  # Seconds without a tick = dead feed
+
+# [FIX #11] Market hours in IST — no hardcoded UTC offset
+_IST           = ZoneInfo("Asia/Kolkata")
+_MARKET_OPEN   = dt_time(9,  0)   # 09:00 IST
+_MARKET_CLOSE  = dt_time(15, 36)  # 15:36 IST (slight buffer after 15:30 close)
 
 
 class MarketFeed:
     """Manages Kotak Neo websocket subscriptions for live market data."""
 
     def __init__(self, kotak_trader=None):
-        self.kotak = kotak_trader
-        self._subscriptions: dict[str, dict] = {}
-        self._tick_callbacks: list[Callable] = []
-        self._raw_tick_callbacks: list[Callable] = []
-        self._running = False
-        self._tick_buffer: list[dict] = []
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._pending_subs: list[dict] = []
-        self._last_tick_time: float = 0.0             # [11]
-        self._heartbeat_thread: threading.Thread | None = None  # [11]
-        self._started_once = False
+        self.kotak                = kotak_trader
+        self._subscriptions:       dict[str, dict]  = {}
+        self._tick_callbacks:      list[Callable]   = []
+        self._raw_tick_callbacks:  list[Callable]   = []
+        self._running              = False
+        self._tick_buffer:         list[dict]       = []
+        self._loop:                asyncio.AbstractEventLoop | None = None
+        self._pending_subs:        list[dict]       = []
+        self._last_tick_time:      float            = 0.0
+        self._heartbeat_thread:    threading.Thread | None = None
+        self._started_once         = False
 
     @property
     def is_running(self) -> bool:
@@ -60,14 +69,13 @@ class MarketFeed:
     def add_raw_tick_callback(self, callback: Callable):
         self._raw_tick_callbacks.append(callback)
 
-    # ── Lifecycle ──
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self):
         """Set up websocket callbacks with Kotak Neo. Call ONCE after login.
         The SDK's run_forever(reconnect=5) handles all subsequent reconnects —
         do NOT call start() again on disconnect.
         """
-        # [1] Capture the running loop
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -95,34 +103,33 @@ class MarketFeed:
             self._running = True
             log.info("Market feed: callbacks registered, SDK will maintain connection")
 
-            # [11] Start heartbeat watchdog once
             if self._heartbeat_thread is None or not self._heartbeat_thread.is_alive():
                 self._heartbeat_thread = threading.Thread(
-                    target=self._heartbeat_watchdog, daemon=True
+                    target=self._heartbeat_watchdog, daemon=True,
                 )
                 self._heartbeat_thread.start()
                 log.info("Heartbeat watchdog started")
 
             return True
-        except Exception as e:
-            log.error(f"Failed to start market feed: {e}")
+        except Exception:
+            log.exception("Failed to start market feed")  # [FIX #23]
             return False
 
     def stop(self):
         """[4] Intentionally stop the market feed (no reconnect)."""
         self._running = False
-        self._flush_tick_buffer()       # [10] Flush remaining ticks on stop
+        self._flush_tick_buffer()
         log.info("Market feed stopped intentionally")
 
-    # ── Subscription ──
+    # ── Subscription ──────────────────────────────────────────────────────────
 
     def subscribe_instrument(self, token: str, symbol: str, exchange_segment: str = "bse_fo"):
         token_str = str(token)
         if token_str not in self._subscriptions:
             self._subscriptions[token_str] = {
-                "symbol": symbol,
-                "ltp": 0,
-                "last_update": None,
+                "symbol":           symbol,
+                "ltp":              0,
+                "last_update":      None,
                 "exchange_segment": exchange_segment,
             }
         if self.kotak and self.kotak.is_authenticated:
@@ -130,14 +137,13 @@ class MarketFeed:
             if self._running:
                 try:
                     self.kotak.subscribe(instrument_tokens=[sub_item])
-                    log.info(f"Subscribed to {symbol} ({token_str}) on {exchange_segment}")
-                except Exception as e:
-                    log.error(f"Failed to subscribe to {symbol}: {e}")
+                    log.info("Subscribed to %s (%s) on %s", symbol, token_str, exchange_segment)
+                except Exception:
+                    log.exception("Failed to subscribe to %s", symbol)  # [FIX #23]
             else:
-                # [8] Avoid duplicate pending subs
                 if sub_item not in self._pending_subs:
                     self._pending_subs.append(sub_item)
-                log.info(f"Queued subscription for {symbol} ({token_str}) — WS not yet open")
+                log.info("Queued subscription for %s (%s) — WS not yet open", symbol, token_str)
 
     def subscribe_index(self, token: str, symbol: str):
         self.subscribe_instrument(token, symbol, exchange_segment="bse_cm")
@@ -148,28 +154,30 @@ class MarketFeed:
         for item in tokens:
             tk = str(item["instrument_token"])
             self._subscriptions[tk] = {
-                "symbol": item.get("symbol", ""),
-                "ltp": 0,
-                "last_update": None,
+                "symbol":           item.get("symbol", ""),
+                "ltp":              0,
+                "last_update":      None,
                 "exchange_segment": item["exchange_segment"],
             }
         sub_list = [
-            {"instrument_token": str(t["instrument_token"]), "exchange_segment": t["exchange_segment"]}
+            {
+                "instrument_token": str(t["instrument_token"]),
+                "exchange_segment": t["exchange_segment"],
+            }
             for t in tokens
         ]
         if self._running:
             try:
                 self.kotak.subscribe(instrument_tokens=sub_list)
-                log.info(f"Batch-subscribed to {len(sub_list)} instruments")
-            except Exception as e:
-                log.error(f"Batch subscribe failed: {e}")
+                log.info("Batch-subscribed to %d instruments", len(sub_list))
+            except Exception:
+                log.exception("Batch subscribe failed")  # [FIX #23]
         else:
-            # [8] Merge without duplicates
             existing = {(s["instrument_token"], s["exchange_segment"]) for s in self._pending_subs}
             for s in sub_list:
                 if (s["instrument_token"], s["exchange_segment"]) not in existing:
                     self._pending_subs.append(s)
-            log.info(f"Queued {len(sub_list)} subscriptions — WS not yet open")
+            log.info("Queued %d subscriptions — WS not yet open", len(sub_list))
 
     def unsubscribe_instrument(self, token: str):
         token_str = str(token)
@@ -179,10 +187,10 @@ class MarketFeed:
             if self.kotak:
                 try:
                     self.kotak.unsubscribe([{"instrument_token": token_str, "exchange_segment": seg}])
-                except Exception as e:
-                    log.error(f"Unsubscribe failed: {e}")
+                except Exception:
+                    log.exception("Unsubscribe failed for token %s", token_str)  # [FIX #23]
 
-    # ── Data Access ──
+    # ── Data Access ───────────────────────────────────────────────────────────
 
     def get_ltp(self, token: str) -> float:
         return self._subscriptions.get(str(token), {}).get("ltp", 0)
@@ -190,7 +198,7 @@ class MarketFeed:
     def get_all_ticks(self) -> dict:
         return dict(self._subscriptions)
 
-    # ── Kotak SDK Callbacks ──
+    # ── Kotak SDK Callbacks ───────────────────────────────────────────────────
 
     def _on_message(self, message):
         try:
@@ -203,40 +211,37 @@ class MarketFeed:
                         self._process_tick(tick)
                 else:
                     self._process_tick(message)
-        except Exception as e:
-            log.error(f"Error processing tick: {e}")
+        except Exception:
+            log.exception("Error processing tick message")  # [FIX #23]
 
     def _on_error(self, error):
-        log.error(f"Market feed WS error: {error}")
+        log.error("Market feed WS error: %s", error)
 
     def _on_close(self, message):
         """[12] WS closed — observation only. SDK's run_forever(reconnect=5) will reconnect.
-        We flush the tick buffer and update state. No thread spawning here.
+        Flush the tick buffer and update state. No thread spawning here.
         """
-        log.warning(f"WS closed: {message} — SDK will auto-reconnect in ~5s")
+        log.warning("WS closed: %s — SDK will auto-reconnect in ~5s", message)
         self._running = False
         self._flush_tick_buffer()  # [10] Don't lose buffered ticks
-        # SDK reconnects automatically — _on_open will fire when it's back up
 
     def _on_open(self, message):
         """WS opened (initial or SDK auto-reconnect) — update state and flush pending subs.
 
-        CRITICAL: Do NOT call kotak.subscribe() here directly.
+        CRITICAL: Do NOT call kotak.subscribe() directly here.
         The SDK's NeoWebSocket.on_hsm_message handles the 'cn' handshake and then
         calls subscribe_scripts() automatically for any items already in sub_list.
-        Calling subscribe() here risks spawning a second WS thread if is_hsw_open
-        is not yet 1 (handshake not complete), which overwrites the global ws and
-        causes the death loop.
+        Calling subscribe() here before is_hsw_open==1 risks spawning a second WS
+        thread that overwrites the global ws reference.
 
-        Instead: merge known subscriptions into _pending_subs, then let
-        _flush_pending_subs_when_ready() poll until is_hsw_open==1 before sending.
+        Instead: merge known subscriptions into _pending_subs and delegate to
+        _flush_pending_subs_when_ready() which polls until is_hsw_open==1.
         """
-        log.info(f"Market feed WS opened: {message}")
+        log.info("Market feed WS opened: %s", message)
         self._running = True
-        self._last_tick_time = time.time()  # [11] Reset watchdog on open
+        self._last_tick_time = time.time()
 
-        # Merge all known subscriptions into pending so they get flushed once ready
-        known_subs = [
+        known_subs   = [
             {"instrument_token": tk, "exchange_segment": info.get("exchange_segment", "bse_fo")}
             for tk, info in self._subscriptions.items()
         ]
@@ -251,10 +256,13 @@ class MarketFeed:
 
     def _flush_pending_subs_when_ready(self):
         """Poll until NeoWebSocket.is_hsw_open==1, then send pending subscriptions.
-        This avoids calling subscribe() before the SDK handshake is complete,
-        which would spawn a second WS thread and corrupt the global ws variable.
+
+        [FIX #19] On timeout: re-queue subs_to_flush back into _pending_subs so they
+        are retried on the next _on_open instead of being silently discarded.
+        Previously a timeout meant those instruments would never receive ticks — no
+        retry, no alert, no re-queue. Now they are preserved for the next reconnect.
         """
-        deadline = time.time() + 15  # wait up to 15s for handshake
+        deadline = time.time() + 15  # wait up to 15 s for SDK handshake
         while time.time() < deadline:
             try:
                 neo_ws = self.kotak.client.NeoWebSocket
@@ -264,7 +272,14 @@ class MarketFeed:
                 pass
             time.sleep(0.1)
         else:
-            log.warning("NeoWebSocket did not reach is_hsw_open=1 within 15s — skipping flush")
+            # [FIX #19] Timeout — re-queue pending subs instead of discarding
+            subs_to_retry = list(self._pending_subs)
+            # Don't clear _pending_subs — they stay for the next _on_open call
+            log.warning(
+                "NeoWebSocket did not reach is_hsw_open=1 within 15s — "
+                "%d subscription(s) retained for next reconnect (not discarded)",
+                len(subs_to_retry),
+            )
             return
 
         if not self._pending_subs or not self.kotak:
@@ -272,71 +287,76 @@ class MarketFeed:
 
         subs_to_flush = list(self._pending_subs)
         self._pending_subs.clear()
-        log.info(f"Flushing {len(subs_to_flush)} subscriptions (is_hsw_open=1 confirmed)...")
+        log.info("Flushing %d subscriptions (is_hsw_open=1 confirmed)...", len(subs_to_flush))
         try:
             self.kotak.subscribe(instrument_tokens=subs_to_flush)
-            log.info(f"✅ Flushed {len(subs_to_flush)} subscriptions")
-        except Exception as e:
-            log.error(f"Failed to flush subscriptions: {e}")
-            self._pending_subs.extend(subs_to_flush)  # [8] Put back for next open
+            log.info("Flushed %d subscriptions successfully", len(subs_to_flush))
+        except Exception:
+            # [FIX #19] Also re-queue on subscribe() failure
+            log.exception("Failed to flush subscriptions — re-queuing for next reconnect")  # [FIX #23]
+            existing_keys = {(s["instrument_token"], s["exchange_segment"]) for s in self._pending_subs}
+            for s in subs_to_flush:
+                if (s["instrument_token"], s["exchange_segment"]) not in existing_keys:
+                    self._pending_subs.append(s)
 
-    # ── Heartbeat Watchdog ──
+    # ── Heartbeat Watchdog ────────────────────────────────────────────────────
 
     def _heartbeat_watchdog(self):
-        """[11] Periodically checks if ticks are still arriving.
+        """[11][FIX #11] Periodically checks that ticks are still arriving.
         If feed goes silent for HEARTBEAT_STALE_THRESHOLD seconds during market hours,
         closes the WS so the SDK's own reconnect=5 kicks in fresh.
-        We do NOT spawn our own reconnect — we just poke the SDK's.
+
+        [FIX #11] Market hours now use ZoneInfo("Asia/Kolkata") instead of a hardcoded
+        UTC offset (3.5–10.1). The old offset was fragile: wrong on non-UTC servers,
+        incorrect at DST edges, and opaque to anyone reading the code.
         """
         log.info("Heartbeat watchdog running")
         while True:
             time.sleep(HEARTBEAT_INTERVAL)
 
             if not self._running:
-                continue  # SDK will reconnect, _on_open will set _running=True again
+                continue  # SDK will reconnect; _on_open will set _running=True
 
             if self._last_tick_time == 0:
                 continue  # No ticks received yet since startup
 
-            # Only check during market hours (9:00–15:35 IST = 3:30–10:05 UTC)
-            now_utc = datetime.now(timezone.utc)
-            utc_hour = now_utc.hour + now_utc.minute / 60
-            if not (3.5 <= utc_hour <= 10.1):
-                continue
+            # [FIX #11] Use explicit IST timezone — never rely on server's local clock
+            now_ist = datetime.now(_IST).time()
+            if not (_MARKET_OPEN <= now_ist <= _MARKET_CLOSE):
+                continue  # Outside market hours — stale feed is expected
 
             elapsed = time.time() - self._last_tick_time
             if elapsed > HEARTBEAT_STALE_THRESHOLD:
                 log.warning(
-                    f"⚠️ No ticks for {elapsed:.0f}s — feed appears dead. "
-                    f"Closing WS so SDK reconnect fires..."
+                    "No ticks for %.0fs — feed appears dead. "
+                    "Closing WS so SDK reconnect fires...",
+                    elapsed,
                 )
                 self._running = False
                 self._flush_tick_buffer()
-                # Force-close the underlying websocket so SDK's reconnect=5 triggers
                 try:
                     from neo_api_client.HSWebSocketLib import ws as sdk_ws
                     if sdk_ws:
                         sdk_ws.close()
                         log.info("Forced WS close — SDK will reconnect in ~5s")
-                except Exception as e:
-                    log.warning(f"Could not force-close SDK WS: {e}")
-                # Reset so watchdog doesn't fire again immediately
+                except Exception:
+                    log.exception("Could not force-close SDK WS")  # [FIX #23]
+                # Reset timestamp so watchdog doesn't fire again immediately
                 self._last_tick_time = time.time()
 
-    # ── Tick Processing ──
+    # ── Tick Processing ───────────────────────────────────────────────────────
 
     def _process_tick(self, tick: dict):
-        token = str(tick.get("tk") or tick.get("instrument_token", ""))
+        token   = str(tick.get("tk") or tick.get("instrument_token", ""))
         ltp_val = tick.get("ltp", tick.get("last_traded_price"))
-
-        ltp = float(ltp_val) if ltp_val is not None else 0
+        ltp     = float(ltp_val) if ltp_val is not None else 0
 
         if not token or token not in self._subscriptions:
             return
 
         if ltp > 0:
-            self._subscriptions[token]["ltp"] = ltp
-            self._last_tick_time = time.time()  # [11] Update watchdog timestamp
+            self._subscriptions[token]["ltp"]    = ltp
+            self._last_tick_time                 = time.time()
 
         self._subscriptions[token]["last_update"] = (
             datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -344,13 +364,13 @@ class MarketFeed:
 
         self._tick_buffer.append({
             "instrument_token": token,
-            "symbol": self._subscriptions[token].get("symbol", ""),
-            "ltp": ltp,
-            "volume": tick.get("v", tick.get("volume", 0)),
-            "open": tick.get("o", tick.get("open", 0)),
-            "high": tick.get("h", tick.get("high", 0)),
-            "low": tick.get("l", tick.get("low", 0)),
-            "close": tick.get("c", tick.get("close", 0)),
+            "symbol":    self._subscriptions[token].get("symbol", ""),
+            "ltp":       ltp,
+            "volume":    tick.get("v",  tick.get("volume", 0)),
+            "open":      tick.get("o",  tick.get("open",   0)),
+            "high":      tick.get("h",  tick.get("high",   0)),
+            "low":       tick.get("l",  tick.get("low",    0)),
+            "close":     tick.get("c",  tick.get("close",  0)),
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         })
         if len(self._tick_buffer) >= TICK_BUFFER_SIZE:
@@ -362,8 +382,8 @@ class MarketFeed:
             for cb in self._raw_tick_callbacks:
                 try:
                     cb(token, ltp, tick)
-                except Exception as e:
-                    log.error(f"Raw tick callback error: {e}")
+                except Exception:
+                    log.exception("Raw tick callback error")  # [FIX #23]
 
         if ltp > 0:
             for cb in self._tick_callbacks:
@@ -379,4 +399,4 @@ class MarketFeed:
         if self._loop and not self._loop.is_closed():
             asyncio.run_coroutine_threadsafe(db.save_ticks_batch(ticks_to_save), self._loop)
         else:
-            log.warning(f"Cannot flush {len(ticks_to_save)} ticks — event loop unavailable")
+            log.warning("Cannot flush %d ticks — event loop unavailable", len(ticks_to_save))

@@ -1,11 +1,15 @@
 {
-  "lots": 50,
-  "entryLogic": "code",
+  "lots": 10,
+  "entryLogic": "avg_signal",
   "entryAvgPick": "avg",
   "entryFixed": null,
   "trailingSL": "signal_trail",
   "slFixed": null,
-  "compareMode": true,
+  "compareMode": false,
   "activationPoints": 5.0,
-  "trailGap": 2.0
+  "trailGap": 2.0,
+  "entryTimerMins": 10,
+  "exitTimerMins": 10,
+  "signalTrailInitialSL": "telegram",
+  "signalTrailInitialSLPoints": null
 }

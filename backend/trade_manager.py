@@ -15,6 +15,12 @@ PATCHES APPLIED:
 [10] new_message broadcast uses raw_text key for consistency with DB schema
 [11] compareMode added — spawns all 5 entry strategies simultaneously for comparison
 [14] signal_trail SL mode added to strategy defaults with activationPoints and trailGap
+[FIX #3 ] compare mode no longer bypasses dedup — sig_hash check AND open-position check
+          both run unconditionally before the compare/live branch split
+[FIX #16] all datetime calls use explicit UTC (via _utc_now()) — no more naive datetimes
+[FIX #23] bare except: pass / except Exception as e: log.error replaced with log.exception()
+[FIX #25] stop_trading flag added — when True, message/signal is saved and broadcast but
+          no trade is placed. Flag is set by main.py before every process_message call.
 """
 import asyncio
 import logging
@@ -32,12 +38,16 @@ from . import database as db
 
 log = logging.getLogger(__name__)
 
-# [5] Use explicit IST timezone for all market hours checks
+# [5] Explicit IST timezone — never rely on server's local clock
 IST = ZoneInfo("Asia/Kolkata")
 
-# Indian market hours (IST)
-MARKET_OPEN = time(9, 15)
+MARKET_OPEN  = time(9, 15)
 MARKET_CLOSE = time(15, 30)
+
+
+def _utc_now() -> str:
+    """[FIX #16] Return current UTC time as ISO-8601 string with Z suffix."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class TradeManager:
@@ -52,224 +62,301 @@ class TradeManager:
         self.contract_master = ContractMaster()
         self.lot_size = int(Config.DEFAULT_LOT_SIZE)
 
-        # [4] entryAvgPick added to defaults so all keys are always present
-        # [11] compareMode: when True, all 5 entry strategies run simultaneously
+        # [FIX #25] Stop-trading flag — when True, signals are saved/broadcast
+        # but no trade is placed. Set by main.py before every process_message call.
+        self.stop_trading: bool = False
+
+        # [4] entryAvgPick always present — prevents KeyError downstream
+        # [11] compareMode: when True all 5 entry strategies run simultaneously
         # [14] activationPoints / trailGap: used by signal_trail SL mode
         self.strategy: Dict[str, Any] = {
-            'lots': 1,
-            'entryLogic': 'code',          # 'code' | 'avg_signal' | 'fixed'
-            'entryAvgPick': 'avg',         # 'low' | 'avg' | 'high'  (for avg_signal mode)
-            'entryFixed': None,
-            'trailingSL': 'code',          # 'code' | 'signal' | 'ltp' | 'fixed' | 'signal_trail'
-            'slFixed': None,
-            'activationPoints': 5.0,       # [14] signal_trail: pts above entry to activate trailing
-            'trailGap': 2.0,               # [14] signal_trail: pts behind LTP to trail SL
-            'compareMode': False,          # [11] when True, runs all 5 entry modes simultaneously
+            "lots":             1,
+            "entryLogic":       "code",
+            "entryAvgPick":     "avg",
+            "entryFixed":       None,
+            "trailingSL":       "code",
+            "slFixed":          None,
+            "activationPoints": 5.0,
+            "trailGap":         2.0,
+            "compareMode":      False,
         }
 
-        # [3] Keyed as "YYYY-MM-DD-strike-option_type" so the same strike is
-        # allowed again on a new trading day without needing a manual reset.
+        # [3] Keyed as "YYYY-MM-DD-strike-option_type" — same strike allowed again next day
         self._processed_signals: set[str] = set()
         self._ws_broadcast: Optional[Callable] = None
         self.kotak_login_state: str = "idle"
         self.kotak_last_login_error: Optional[str] = None
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
     def _sig_hash(self, strike, option_type: str) -> str:
-        """[3] Build a date-scoped dedup key so signals recur correctly next day."""
+        """[3] Date-scoped dedup key — signals recur correctly on a new trading day."""
         today = date.today().isoformat()
         return f"{today}-{strike}-{option_type.upper()}"
 
     def on_trade_expired(self, trading_symbol: str):
-        """Called by paper_trader when a pending order expires — unlock that strike for re-entry."""
+        """Called by paper_trader when a pending order expires — unlock that strike."""
         import re
         m = re.search(r'(\d{4,6})(CE|PE)$', trading_symbol.upper())
         if m:
             strike, option_type = m.group(1), m.group(2)
             sig_hash = self._sig_hash(strike, option_type)
             self._processed_signals.discard(sig_hash)
-            log.info(f"Trade expired — unlocked {sig_hash} for re-entry")
+            log.info("Trade expired — unlocked %s for re-entry", sig_hash)
 
     def set_lot_size(self, lots: int):
-        """Update the number of lots for upcoming trades."""
         self.lot_size = max(1, int(lots))
-        log.info(f"Lot size updated to {self.lot_size}")
+        log.info("Lot size updated to %d", self.lot_size)
         return {"status": "ok", "lot_size": self.lot_size}
 
     def set_ws_broadcast(self, broadcast_fn):
-        """Set the WebSocket broadcast function for real-time frontend updates.
-        Passed to PaperTrader as well so position/order updates reach the frontend directly.
-        """
+        """Set the WebSocket broadcast function for real-time frontend updates."""
         self._ws_broadcast = broadcast_fn
         self.paper_trader.set_ws_broadcast(broadcast_fn)
 
     async def _broadcast(self, event_type: str, data: dict):
-        """Broadcast event to all WebSocket clients."""
         if self._ws_broadcast:
             try:
                 await self._ws_broadcast({"type": event_type, "data": data})
-            except Exception as e:
-                log.error(f"Broadcast error: {e}")
+            except Exception:
+                log.exception("Broadcast error in TradeManager")  # [FIX #23]
 
-    # ── Signal Processing Pipeline ──
+    # ── Signal Processing Pipeline ────────────────────────────────────────────
 
     async def process_message(self, text: str, sender: str = "", timestamp: str = ""):
-        """Full pipeline: receive message → parse → execute trade → broadcast."""
+        """Full pipeline: receive → parse → deduplicate → execute → broadcast."""
+
         # 1. Save raw message
         msg_id = await db.save_message(text, sender=sender)
 
-        # [10] Use raw_text key to match what db.get_messages() returns on page load
+        # [10] raw_text key matches what db.get_messages() returns on page load
         await self._broadcast("new_message", {
-            "id": msg_id,
-            "raw_text": text,
-            "sender": sender,
-            "timestamp": timestamp or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            "id":        msg_id,
+            "raw_text":  text,
+            "sender":    sender,
+            "timestamp": timestamp or _utc_now(),
         })
 
         # 2. Parse signal
-        signal = parse_signal(text)
+        signal      = parse_signal(text)
         signal_dict = signal.to_dict()
 
         # 3. Save parsed signal
-        signal_id = await db.save_signal(msg_id, signal_dict)
-        signal_dict["id"] = signal_id
-        signal_dict["message_id"] = msg_id
+        signal_id            = await db.save_signal(msg_id, signal_dict)
+        signal_dict["id"]           = signal_id
+        signal_dict["message_id"]   = msg_id
 
-        # Get initial LTP if available
+        # Attach live LTP if available
         initial_ltp = 0
         if self.market_feed and self.contract_master:
-            op_type = signal_dict.get('option_type') or ''
-            lookup = self.contract_master.lookup(str(signal_dict.get('strike') or ''), op_type)
+            op_type = signal_dict.get("option_type") or ""
+            lookup  = self.contract_master.lookup(str(signal_dict.get("strike") or ""), op_type)
             if lookup:
-                token = lookup['instrument_token']
-                initial_ltp = self.market_feed.get_ltp(token)
+                initial_ltp = self.market_feed.get_ltp(lookup["instrument_token"])
 
-        signal_dict["created_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        signal_dict["live_ltp"] = initial_ltp
+        signal_dict["created_at"] = _utc_now()
+        signal_dict["live_ltp"]   = initial_ltp
         await self._broadcast("new_signal", signal_dict)
 
         if signal.status != "valid":
-            log.info(f"Signal ignored: {signal.reason}")
+            log.info("Signal ignored: %s", signal.reason)
             return {"message_id": msg_id, "signal": signal_dict, "trade": None}
 
-        # Subscribe to market feed immediately for valid signals
+        # Subscribe to market feed for valid signals
         if self.market_feed and self.contract_master:
-            op_type = signal_dict.get('option_type') or ''
-            lookup = self.contract_master.lookup(str(signal_dict.get('strike') or ''), op_type)
+            op_type = signal_dict.get("option_type") or ""
+            lookup  = self.contract_master.lookup(str(signal_dict.get("strike") or ""), op_type)
             if lookup:
-                token = lookup['instrument_token']
-                symbol = lookup.get('trading_symbol', f"SENSEX{signal_dict['strike']}{signal_dict['option_type']}")
+                token  = lookup["instrument_token"]
+                symbol = lookup.get(
+                    "trading_symbol",
+                    f"SENSEX{signal_dict['strike']}{signal_dict['option_type']}",
+                )
                 self.market_feed.subscribe_instrument(token, symbol)
-                log.info(f"Subscribed market feed for {symbol} (token: {token})")
+                log.info("Subscribed market feed for %s (token: %s)", symbol, token)
             else:
                 log.warning(
-                    f"Could not find instrument token for {signal_dict.get('strike')} "
-                    f"{signal_dict.get('option_type')} — ticks may not arrive"
+                    "Could not find instrument token for %s %s — ticks may not arrive",
+                    signal_dict.get("strike"), signal_dict.get("option_type"),
                 )
 
-        # 4. Duplicate check — skip if a position is already open for this strike
-        # In compare mode allow multiple positions per strike (each variant is independent)
-        if not self.strategy.get('compareMode'):
-            open_positions = await db.get_positions(mode=self.mode, status="open")
-            for pos in open_positions:
-                if (str(pos.get('strike')) == str(signal.strike) and
-                        str(pos.get('option_type', '')).upper() == signal.option_type.upper()):
-                    log.info(f"Signal skipped — position already open for {signal.strike}-{signal.option_type}")
-                    return {"message_id": msg_id, "signal": signal_dict, "trade": None, "skipped": "position_open"}
+        # [FIX #25] Stop-trading gate — signal saved and broadcast above,
+        # but we skip ALL trade execution when the flag is set.
+        # We DO save a trade row with status='stopped' so it appears in the
+        # trade log, and we broadcast order_update so the signal card shows
+        # 'stopped' status and the countdown timer is suppressed.
+        # We do NOT add to _processed_signals so the signal can be traded
+        # once trading is re-enabled (no dedup block on the next arrival).
+        if self.stop_trading:
+            log.info(
+                "Stop trading enabled — signal %s %s received but not traded",
+                signal.strike, signal.option_type,
+            )
+            # Save a minimal trade row so it appears in the log
+            trading_symbol = f"SENSEX{signal.strike}{signal.option_type}"
+            stopped_trade_data = {
+                "mode":             self.mode,
+                "trading_symbol":   trading_symbol,
+                "transaction_type": "B",
+                "order_type":       "L",
+                "quantity":         self.lot_size,
+                "price":            signal_dict.get("entry_low", 0),
+                "status":           "stopped",
+                "notes":            "Trading stopped — signal not executed",
+            }
+            stopped_trade_id = await db.save_trade(signal_id, stopped_trade_data)
+            stopped_trade_data["trade_id"] = stopped_trade_id
+            stopped_trade_data["id"]       = stopped_trade_id
+            stopped_trade_data["signal_id"] = signal_id
+            stopped_trade_data["created_at"] = _utc_now()
 
-        # [1] Consolidated pending-order replacement
-        sig_suffix = f"{signal.strike}{signal.option_type}".upper()
+            # Broadcast the trade row to the log
+            await self._broadcast("new_trade", stopped_trade_data)
+
+            # Update signal card to show 'stopped' and suppress timer
+            await self._broadcast("order_update", {
+                "id":          stopped_trade_id,
+                "signal_id":   signal_id,
+                "status":      "stopped",
+                "status_note": "Trading stopped",
+            })
+
+            return {
+                "message_id": msg_id,
+                "signal":     signal_dict,
+                "trade":      stopped_trade_data,
+                "skipped":    "stop_trading",
+            }
+
+        # ── [FIX #3] Dedup checks run unconditionally — BEFORE compare/live split ──
+
+        # 4a. Open-position duplicate check
+        open_positions = await db.get_positions(mode=self.mode, status="open")
+        for pos in open_positions:
+            if (str(pos.get("strike")) == str(signal.strike) and
+                    str(pos.get("option_type", "")).upper() == signal.option_type.upper()):
+                log.info(
+                    "Signal skipped — position already open for %s-%s",
+                    signal.strike, signal.option_type,
+                )
+                return {
+                    "message_id": msg_id,
+                    "signal":     signal_dict,
+                    "trade":      None,
+                    "skipped":    "position_open",
+                }
+
+        # [1] Cancel any existing pending order for this strike before placing a new one
+        sig_suffix    = f"{signal.strike}{signal.option_type}".upper()
         pending_trades = [t for t in await db.get_trades(mode=self.mode) if t.get("status") == "pending"]
         order_replaced = False
         replaced_signal_id = None
 
         for order in pending_trades:
-            order_sym = order.get('trading_symbol', '').upper()
+            order_sym = order.get("trading_symbol", "").upper()
             if order_sym.endswith(sig_suffix):
-                await db.update_trade(order["id"], {"status": "replaced"})
+                try:
+                    await db.update_trade(order["id"], {"status": "replaced"})
+                except Exception:
+                    log.exception("process_message: failed to mark order as replaced")
                 self.paper_trader._pending_orders = [
                     po for po in self.paper_trader._pending_orders
                     if po.get("trade_id") != order["id"]
                 ]
-                log.info(f"Cancelled old pending order {order['id']} for {sig_suffix}")
+                log.info("Cancelled old pending order %d for %s", order["id"], sig_suffix)
                 replaced_signal_id = order.get("signal_id")
                 await self._broadcast("order_update", {
-                    "id": order["id"],
-                    "signal_id": replaced_signal_id,
-                    "status": "replaced",
+                    "id":          order["id"],
+                    "signal_id":   replaced_signal_id,
+                    "status":      "replaced",
                     "status_note": "Replaced by newer signal",
                 })
                 order_replaced = True
                 break
 
-        # [3] Use date-scoped hash to allow the same strike on a new trading day
+        # 4b. Sig-hash duplicate check (date-scoped) [FIX #3]
         sig_hash = self._sig_hash(signal.strike, signal.option_type)
-        if sig_hash in self._processed_signals and not order_replaced and not self.strategy.get('compareMode'):
-            log.info(f"Duplicate signal skipped (already processed today): {sig_hash}")
-            return {"message_id": msg_id, "signal": signal_dict, "trade": None, "skipped": "duplicate"}
+        if sig_hash in self._processed_signals and not order_replaced:
+            log.info("Duplicate signal skipped (already processed today): %s", sig_hash)
+            return {
+                "message_id": msg_id,
+                "signal":     signal_dict,
+                "trade":      None,
+                "skipped":    "duplicate",
+            }
 
-        # 5. Market hours check (warn but don't block paper trades)
-        if not self._is_market_open() and self.mode == "real":
-            log.warning("Market is closed — skipping real trade")
-            return {"message_id": msg_id, "signal": signal_dict, "trade": None, "skipped": "market_closed"}
+        # 5. Market hours check (blocks real trades only, warns for paper)
+        if not self._is_market_open():
+            if self.mode == "real":
+                log.warning("Market is closed — skipping real trade")
+                return {
+                    "message_id": msg_id,
+                    "signal":     signal_dict,
+                    "trade":      None,
+                    "skipped":    "market_closed",
+                }
+            else:
+                log.info("Market is closed but paper mode active — proceeding")
 
         # 6. Execute trade
         trade_result: Dict[str, Any] = await self._execute_trade(signal_dict, signal_id)
 
-        # [7] Only mark as processed after a successful execution to allow retries on error
+        # [7] Only mark processed after successful execution — allows retry on error
         if trade_result.get("status") not in ("error", None):
-            if not self.strategy.get('compareMode'):
-                self._processed_signals.add(sig_hash)
+            self._processed_signals.add(sig_hash)
         else:
-            log.warning(f"Trade execution failed for {sig_hash} — not marking as processed so retry is allowed")
+            log.warning(
+                "Trade execution failed for %s — not marking as processed (retry allowed)",
+                sig_hash,
+            )
 
-        order_dict = trade_result.get("order")
+        order_dict    = trade_result.get("order")
         order_sym_out = order_dict.get("trading_symbol", "") if isinstance(order_dict, dict) else ""
 
-        broadcast_data = {
-            **trade_result,
-            "signal_id": signal_id,
+        # Build a clean broadcast payload — only include fields that belong on a trade row.
+        # Spreading **trade_result directly caused ghost rows because the result dict
+        # contains top-level keys (signal_id, skipped, compare_mode etc.) that have no
+        # trade_id/id anchor, making the frontend insert them as new blank rows.
+        broadcast_payload = {
+            **(order_dict if isinstance(order_dict, dict) else {}),
+            **{k: v for k, v in trade_result.items() if k != "order"},
+            "signal_id":      signal_id,
             "trading_symbol": trade_result.get("trading_symbol") or order_sym_out,
         }
 
-        await self._broadcast("new_trade", broadcast_data)
+        await self._broadcast("new_trade", broadcast_payload)
 
         return {"message_id": msg_id, "signal": signal_dict, "trade": trade_result}
 
+    # ── Trade Execution ───────────────────────────────────────────────────────
+
     async def _execute_trade(self, signal: dict, signal_id: int) -> dict:
-        """Route signal to the appropriate trading engine."""
         if self.mode == "paper":
             return await self._execute_paper(signal, signal_id)
         elif self.mode == "real":
             return await self._execute_real(signal, signal_id)
-        else:
-            return {"status": "error", "message": f"Unknown mode: {self.mode}"}
+        return {"status": "error", "message": f"Unknown mode: {self.mode}"}
 
     async def _execute_paper(self, signal: dict, signal_id: int) -> dict:
-        """Execute via paper trading engine.
-        If compareMode is enabled, spawns all 5 entry strategies simultaneously
-        so results can be compared in the trade log.
-        """
+        """Execute via paper trading engine."""
         try:
-            if self.strategy.get('compareMode'):
+            if self.strategy.get("compareMode"):
                 return await self._execute_paper_compare(signal, signal_id)
             result = await self.paper_trader.place_order(
                 signal, signal_id,
                 lot_size=self.lot_size,
                 strategy=self.strategy,
             )
-            log.info(f"Paper trade: {result}")
+            log.info("Paper trade placed: %s", result)
             return result
-        except Exception as e:
-            log.error(f"Paper trade error: {e}")
-            return {"status": "error", "message": str(e)}
+        except Exception:
+            log.exception("Paper trade error")
+            return {"status": "error", "message": "Paper trade failed — see logs"}
 
     async def _execute_paper_compare(self, signal: dict, signal_id: int) -> dict:
-        """[11] Run all 5 entry modes simultaneously on the same signal for comparison.
-        Each order is tagged with its entry_label so the trade log can show them separately.
-        """
-        hi = float(signal.get("entry_high") or 0)
-        lo = float(signal.get("entry_low") or 0)
-        live_ltp = float(signal.get("live_ltp") or 0)
+        """[11] Run all 5 entry modes simultaneously on the same signal for comparison."""
+        hi       = float(signal.get("entry_high") or 0)
+        live_ltp = float(signal.get("live_ltp")   or 0)
 
         variants = [
             {"entryLogic": "code",       "entryAvgPick": "avg",  "entryFixed": None,           "label": "code"},
@@ -281,7 +368,7 @@ class TradeManager:
 
         results = []
         for variant in variants:
-            strat = {**self.strategy, **variant}
+            strat        = {**self.strategy, **variant}
             tagged_signal = {**signal, "entry_label": variant["label"]}
             try:
                 result = await self.paper_trader.place_order(
@@ -291,15 +378,15 @@ class TradeManager:
                 )
                 result["entry_label"] = variant["label"]
                 results.append(result)
-                log.info(f"Compare mode — placed [{variant['label']}] order: {result.get('trade_id')}")
-            except Exception as e:
-                log.error(f"Compare mode error for [{variant['label']}]: {e}")
+                log.info("Compare mode — placed [%s] order: %s", variant["label"], result.get("trade_id"))
+            except Exception:
+                log.exception("Compare mode error for [%s]", variant["label"])
 
         return {
-            "status": "pending",
+            "status":       "pending",
             "compare_mode": True,
-            "variants": results,
-            "trade_id": results[0]["trade_id"] if results else None,
+            "variants":     results,
+            "trade_id":     results[0]["trade_id"] if results else None,
         }
 
     async def _execute_real(self, signal: dict, signal_id: int) -> dict:
@@ -322,7 +409,7 @@ class TradeManager:
 
             if not trading_symbol:
                 trading_symbol = f"SENSEX{signal['strike']}{signal['option_type']}"
-                log.warning(f"Using constructed symbol: {trading_symbol}")
+                log.warning("Using constructed symbol: %s", trading_symbol)
 
             entry_price = signal.get("entry_high", signal.get("entry_low", 0))
             result = self.kotak.place_order(
@@ -335,91 +422,92 @@ class TradeManager:
             )
 
             trade_data = {
-                "mode": "real",
+                "mode":             "real",
                 "exchange_segment": "bse_fo",
-                "trading_symbol": trading_symbol,
+                "trading_symbol":   trading_symbol,
                 "transaction_type": "B",
-                "order_type": "L",
-                "quantity": self.lot_size,
-                "price": entry_price,
-                "status": "placed" if result.get("status") == "ok" else "failed",
-                "order_id": result.get("data", {}).get("nOrdNo", ""),
-                "notes": f"Real BUY {signal['strike']} {signal['option_type']} @ {entry_price}",
+                "order_type":       "L",
+                "quantity":         self.lot_size,
+                "price":            entry_price,
+                "status":           "placed" if result.get("status") == "ok" else "failed",
+                "order_id":         result.get("data", {}).get("nOrdNo", ""),
+                "notes":            f"Real BUY {signal['strike']} {signal['option_type']} @ {entry_price}",
             }
             trade_id = await db.save_trade(signal_id, trade_data)
             trade_data["trade_id"] = trade_id
 
             return {**trade_data, **result}
-        except Exception as e:
-            log.error(f"Real trade error: {e}")
-            return {"status": "error", "message": str(e)}
+        except Exception:
+            log.exception("Real trade error")
+            return {"status": "error", "message": "Real trade failed — see logs"}
+
+    # ── Market Feed ───────────────────────────────────────────────────────────
 
     async def resubscribe_recent_signals(self, limit: int = 20):
-        """Re-subscribe to the market feed for recently processed signals (useful on startup)."""
+        """Re-subscribe to market feed for recently processed signals."""
         if not self.market_feed or not self.contract_master:
             return
 
         recent_signals = await db.get_signals(limit=limit)
         subs_count = 0
         for sig in recent_signals:
-            if sig.get('status') == 'valid' and sig.get('strike') and sig.get('option_type'):
-                lookup = self.contract_master.lookup(str(sig['strike']), sig['option_type'])
+            if sig.get("status") == "valid" and sig.get("strike") and sig.get("option_type"):
+                lookup = self.contract_master.lookup(str(sig["strike"]), sig["option_type"])
                 if lookup:
-                    token = lookup['instrument_token']
-                    symbol = lookup.get('trading_symbol', f"SENSEX{sig['strike']}{sig['option_type']}")
+                    token  = lookup["instrument_token"]
+                    symbol = lookup.get("trading_symbol", f"SENSEX{sig['strike']}{sig['option_type']}")
                     if str(token) not in self.market_feed._subscriptions:
                         self.market_feed.subscribe_instrument(token, symbol)
                         subs_count += 1
-        if subs_count > 0:
-            log.info(f"Re-subscribed to {subs_count} recent signals from database")
+        if subs_count:
+            log.info("Re-subscribed to %d recent signals from database", subs_count)
 
-    # ── Mode Management ──
+    # ── Mode Management ───────────────────────────────────────────────────────
 
     def set_mode(self, mode: str) -> dict:
-        """Switch between paper and real trading."""
         if mode not in ("paper", "real"):
             return {"status": "error", "message": "Mode must be 'paper' or 'real'"}
-
-        old_mode = self.mode
+        old_mode  = self.mode
         self.mode = mode
-        log.info(f"Trading mode changed: {old_mode} → {mode}")
+        log.info("Trading mode changed: %s → %s", old_mode, mode)
         return {"status": "ok", "old_mode": old_mode, "new_mode": mode}
 
-    # ── Kotak Auth ──
+    # ── Kotak Auth ────────────────────────────────────────────────────────────
 
     def initialize_kotak(self) -> dict:
-        """Initialize Kotak Neo client."""
         return {"initialized": self.kotak.initialize()}
 
     def login_kotak(self) -> dict:
-        """Login to Kotak Neo."""
         return self.kotak.login()
 
     async def complete_2fa(self, otp: Optional[str] = None) -> dict:
-        """Complete Kotak Neo 2FA."""
         result = self.kotak.complete_2fa(otp)
         if result.get("status") == "ok":
             self.market_feed.start()
             self.market_feed.add_tick_callback(self.paper_trader.on_tick)
-            # [6] Offload blocking contract download to executor
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self.download_contracts)
             await self.resubscribe_recent_signals(limit=20)
         return result
 
     def download_contracts(self):
-        """Download and cache the daily contract master."""
         if self.kotak.is_authenticated:
-            success = self.contract_master.download(self.kotak)
-            if success:
-                log.info(f"Contract master loaded: {len(self.contract_master.get_all())} SENSEX contracts")
-            else:
-                log.warning("Contract master download failed — using fallback symbol construction")
+            try:
+                success = self.contract_master.download(self.kotak)
+                if success:
+                    log.info(
+                        "Contract master loaded: %d SENSEX contracts",
+                        len(self.contract_master.get_all()),
+                    )
+                else:
+                    log.warning("Contract master download failed — using fallback symbol construction")
+            except Exception:
+                log.exception("download_contracts failed")
 
-    # ── Utilities ──
+    # ── Utilities ─────────────────────────────────────────────────────────────
 
     def _is_market_open(self) -> bool:
-        """[5] Check if Indian stock market is currently open (uses explicit IST timezone)."""
+        """[5] Check market hours using explicit IST timezone."""
         now_ist = datetime.now(IST).time()
         return MARKET_OPEN <= now_ist <= MARKET_CLOSE
 
@@ -432,16 +520,16 @@ class TradeManager:
             kotak_status["last_error"] = self.kotak_last_login_error
 
         return {
-            "mode": self.mode,
-            "market_open": self._is_market_open(),
-            "kotak": kotak_status,
-            "market_feed": self.market_feed.is_running,
-            "telegram": True,  # Overwritten by main.py with live value
+            "mode":         self.mode,
+            "market_open":  self._is_market_open(),
+            "kotak":        kotak_status,
+            "market_feed":  self.market_feed.is_running,
+            "telegram":     True,   # overwritten by main.py with live value
             "paper_trader": self.paper_trader.get_pnl_summary(),
-            "lot_size": self.lot_size,
-            "strategy": self.strategy,
+            "lot_size":     self.lot_size,
+            "strategy":     self.strategy,
         }
 
     def clear_duplicates(self):
-        """Reset the duplicate signal tracker (e.g. for a new day)."""
+        """Reset duplicate signal tracker (e.g. for a new day)."""
         self._processed_signals.clear()
